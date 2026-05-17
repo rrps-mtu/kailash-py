@@ -210,3 +210,4 @@ dist/
 
 # Secrets baseline (local security scanning)
 .secrets.baseline
+.claude/bin/*.local.json

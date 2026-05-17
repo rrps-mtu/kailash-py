@@ -1,15 +1,15 @@
 {
-  "version": "1.0.9",
+  "version": "1.0.10",
   "type": "coc-build",
   "variant": "py",
-  "updated": "2026-05-09",
+  "updated": "2026-05-18",
   "description": "Kailash Python SDK BUILD repo",
   "upstream": {
     "source": "loom",
-    "version": "2.29.4",
-    "build_version": "2.29.4",
-    "synced_at": "2026-05-12T02:39:19Z",
-    "loom_sha": "e9d2e331",
+    "version": "2.31.0",
+    "build_version": "2.31.0",
+    "synced_at": "2026-05-17T19:40:59Z",
+    "loom_sha": "90ecdc6",
     "sdk_packages": {
       "kailash": "2.13.3",
       "kailash-dataflow": "2.7.5",
@@ -21,10 +21,25 @@
       "kailash-align": "0.7.0",
       "kaizen-agents": "0.9.4"
     },
-    "template_version": "2.29.4",
-    "source_commit": "e9d2e331"
+    "template_version": "2.31.0",
+    "source_commit": "90ecdc6"
   },
   "changelog": [
+    {
+      "version": "1.0.10",
+      "date": "2026-05-18",
+      "summary": "Sync loom 2.29.4 → 2.31.0 (/sync-to-build, loom_sha 90ecdc6). Incremental BUILD-side distribution: 188 created, 46 modified (shared-artifact version-growth), 1 slot-keyed composed (rules/deployment.md), 3 legacy full-file py overlays, 627 unchanged, 648 skipped (exclude + build_exclude + non-subscribed-tier). use_exclude paths INCLUDED (BUILD-bound, inverse of Gate-2). Universal obsoleted purge ran PRE-write: .claude/skills/management/ removed (hollow-frontmatter stale skill; py BUILD has no variant_only re-establishment). Working-tree-only delivery on branch chore/sync-to-build-2026-05-18; no PR (human gate). SDK source versions (pyproject.toml) intentionally untouched — /sync-to-build distributes .claude/ artifacts only.",
+      "changes": [
+        "loom 2.29.4 → 2.31.0 (loom HEAD 90ecdc60e998a223fad34c89a82876c4acbb1fc9)",
+        "sync_plan: unchanged=627 created=188 modified=46 composed=1 legacy-overlay=3 variant_only=0 skipped=648 purged=1",
+        "COMPOSED (slot-keyed py overlay via compose.mjs): rules/deployment.md",
+        "LEGACY-OVERLAY (full-file py overlay copied verbatim): hooks/validate-prod-deploy.js, skills/03-nexus/nexus-handler-support.md, skills/spec-compliance/SKILL.md",
+        "PURGED per universal obsoleted: (PRE-write, coc-sync Step 4.5 ordering): .claude/skills/management/ (8 files; hollow-frontmatter stale skill, user-approved REMOVE per manifest)",
+        "FLAGGED (version-growth, NOT local adaptation — verified via git log: last touch was prior loom /sync-to-build, safe to update): guides/rule-extracts/repo-scope-discipline.md (90→176L), rules/artifact-flow.md (123→206L)",
+        ".coc-obsoleted regenerated from sync-manifest.yaml::obsoleted (28 paths; use_obsoleted NOT included — BUILD-owned)",
+        "PRESERVED: BUILD-only agents/hooks/skills (no loom counterpart), CLAUDE.md, settings.json, learning/, SDK source (packages/**, pyproject.toml)"
+      ]
+    },
     {
       "version": "1.0.9",
       "date": "2026-05-09",
