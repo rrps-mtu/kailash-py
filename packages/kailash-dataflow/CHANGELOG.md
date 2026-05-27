@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+## [2.10.0] — 2026-05-19 — node-registry collision fix (#891)
+
+**Requires `kailash>=2.23.0`** — generated CRUD-node registration now passes
+`NodeRegistry.register(..., allow_override=True)`, an argument introduced in
+kailash 2.23.0.
+
+### Changed
+
+- **`HybridSearchNode` renamed to `PgVectorHybridSearchNode` (#891)** — the
+  pgvector hybrid-search node registered the same global registry name as
+  kailash-kaizen's RAG `HybridSearchNode`, making `add_node("HybridSearchNode")`
+  resolve import-order-dependently. The `HybridSearchNode` Python symbol remains
+  importable for one minor cycle as a deprecation alias (a plain module alias —
+  not re-registered). Migration: `add_node("HybridSearchNode", ...)` →
+  `add_node("PgVectorHybridSearchNode", ...)`.
+- **`BulkUpsertNode` renamed to `DataFlowBulkUpsertNode` (#891)** — the standalone
+  bulk-upsert node collided with the kailash core `BulkUpsertNode`. Migration:
+  `add_node("BulkUpsertNode", ...)` → `add_node("DataFlowBulkUpsertNode", ...)`.
+  Per-model generated `{Model}BulkUpsertNode` names are unaffected.
+- **`mongodb_nodes.AggregateNode` renamed to `MongoAggregateNode` (#891)** — the
+  MongoDB aggregation-pipeline node collided with `aggregate_operations`'s SQL
+  `AggregateNode`. The SQL node keeps the `AggregateNode` name; the MongoDB node
+  is renamed. Migration for the MongoDB pipeline node only:
+  `add_node("AggregateNode", ...)` → `add_node("MongoAggregateNode", ...)`.
+
+## [2.9.19] — 2026-05-18 — TransactionScope.execute_raw write-protection (#1083 follow-up)
+
+### Fixed
+
+- **`TransactionScope.execute_raw` write-protection bypass (HIGH, #1083 follow-up)** — `TransactionScope.execute_raw` (async) and `SyncTransactionScope.execute_raw` (sync) were the only DataFlow write surfaces not routed through `WriteProtectionEngine.check_operation` (spec invariant I1, `specs/dataflow-protection.md`). A caller with `read_only_mode=True` could mutate state via `async with db.transactions.begin() as tx: await tx.execute_raw("DELETE FROM ...")`. New `_classify_raw_sql_operation` + `_execute_raw_with_protection` helpers classify raw SQL by leading keyword (SELECT/WITH/SHOW/EXPLAIN → read; INSERT/UPDATE/DELETE/UPSERT → existing `OperationType`; DDL/unknown → `custom_query`, fail-closed) and call `check_operation` before connection dispatch. Same-bug-class with the #1050/#1058 enforcement chain. Surfaced by multi-agent `/redteam` against the #1083 closure.
+- **`auditor.log_violation` schema-name disclosure at WARN (observability Rule 8)** — the structured WARN log now emits an 8-char sha256 fingerprint of `model.field` instead of raw schema identifiers; raw values stay process-local in the audit `events` dict.
+
+## [2.9.18] — 2026-05-18 — sanitizer set/tuple type-confusion fix (#1047)
+
+### Fixed
+
+- **set/tuple type-confusion bypass in the input sanitizer (#1047)** — a str-declared field receiving a `set`/`tuple` was silently `str()`-coerced (bypassing the type-confusion gate) instead of raising `ValueError` per the security Sanitizer Contract Rule 2. `dict`/`list` already conformed; `set`/`tuple` were the only violators. Fixed on both the single-value and bulk paths by adding `set, tuple` to `sanitize_sql_input`'s `safe_types` so the existing type-confusion gate sees the real container and raises. Added tier-1 sanitizer-contract test coverage (Rules 1+2+3). Fixes #1047.
+
+## [2.9.17] — 2026-05-18 — aiosqlite :memory: connection leak fix (#1051)
+
+### Fixed
+
+- **aiosqlite `:memory:` connection leaked on `DataFlow`/`ProtectedDataFlow` `close()` (#1051)** — multi-sited fix in `engine.py`: untracked per-query `:memory:` connection is now reused and closed; `ProductionSQLiteAdapter.disconnect` handles both branches; node `_owned_adapters` teardown; engine cached-node teardown resolved `cleanup()` vs the dead `hasattr(close)` guard. Fixes #1051.
+
 ## [2.9.16] — 2026-05-17 — protection ordering + UPSERT enum + import_file swallow (#1058 Shards 2 + 3 + 4)
 
 ### Fixed

@@ -6,13 +6,13 @@ and operations into reusable workflow patterns.
 """
 
 import logging
-from typing import Any, Dict, Optional
+import os
+from typing import Optional
 
+from kailash.nodes.base import register_node
+from kailash.nodes.logic.workflow import WorkflowNode
 from kailash.workflow.builder import WorkflowBuilder
 
-from ..base import Node, NodeParameter, register_node
-from ..logic import SwitchNode
-from ..logic.workflow import WorkflowNode
 from .strategies import (
     RAGConfig,
     create_hierarchical_rag_workflow,
@@ -22,6 +22,14 @@ from .strategies import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -41,9 +49,15 @@ class SimpleRAGWorkflowNode(WorkflowNode):
         # Create semantic RAG workflow
         workflow_node = create_semantic_rag_workflow(self.rag_config)
 
-        # Initialize as WorkflowNode
+        # Initialize as WorkflowNode.
+        # `# type: ignore[attr-defined]` on every `.workflow` access in this
+        # module: @register_node erases the concrete WorkflowNode type to base
+        # Node, so a static checker does not see `.workflow` — but it IS a real
+        # read-only WorkflowNode property (added by shard A3) and resolves at
+        # runtime. (Known Core SDK type-erasure gap; B1-B6 worked around it the
+        # same way at the call site.)
         super().__init__(
-            workflow=workflow_node.workflow,
+            workflow=workflow_node.workflow,  # type: ignore[attr-defined]
             name=name,
             description="Simple RAG workflow with semantic chunking and dense retrieval",
         )
@@ -84,11 +98,19 @@ class AdvancedRAGWorkflowNode(WorkflowNode):
                 "code": """
 # Analyze document quality and determine best RAG strategy
 def analyze_documents(documents):
+    # `_content` is a nested local (PythonCodeNode execs the body in a scope
+    # where module-level defs are not visible to nested genexprs). A
+    # present-but-None `content` key returns None from dict.get(..., ""), so
+    # `or ""` is required; non-dict elements are filtered out first.
+    def _content(doc):
+        return (doc.get("content") or "") if isinstance(doc, dict) else ""
+
+    documents = [d for d in (documents or []) if isinstance(d, dict)]
     analysis = {
         "total_docs": len(documents),
-        "avg_length": sum(len(doc.get("content", "")) for doc in documents) / len(documents) if documents else 0,
+        "avg_length": sum(len(_content(doc)) for doc in documents) / len(documents) if documents else 0,
         "has_structure": any("section" in doc or "heading" in doc for doc in documents),
-        "is_technical": any(keyword in doc.get("content", "").lower()
+        "is_technical": any(keyword in _content(doc).lower()
                           for doc in documents
                           for keyword in ["code", "function", "algorithm", "api", "class"]),
         "recommended_strategy": "semantic"  # Default
@@ -109,18 +131,19 @@ result = {"analysis": analyze_documents(documents), "documents": documents}
             },
         )
 
-        # Strategy router using switch node
+        # Strategy router using switch node.
+        # SwitchNode multi-case mode: `cases` is the list of values to match on
+        # the `condition_field`; each match is emitted on a `case_<value>`
+        # output port (see kailash SwitchNode._sanitize_case_name). The four
+        # strategy names contain no characters that sanitize, so the ports are
+        # `case_semantic` / `case_statistical` / `case_hybrid` /
+        # `case_hierarchical`.
         router_id = builder.add_node(
             "SwitchNode",
             node_id="strategy_router",
             config={
-                "condition_field": "analysis.recommended_strategy",
-                "routes": {
-                    "semantic": "semantic_rag_pipeline",
-                    "statistical": "statistical_rag_pipeline",
-                    "hybrid": "hybrid_rag_pipeline",
-                    "hierarchical": "hierarchical_rag_pipeline",
-                },
+                "condition_field": "recommended_strategy",
+                "cases": ["semantic", "statistical", "hybrid", "hierarchical"],
             },
         )
 
@@ -133,25 +156,25 @@ result = {"analysis": analyze_documents(documents), "documents": documents}
         semantic_id = builder.add_node(
             "WorkflowNode",
             node_id="semantic_rag_pipeline",
-            config={"workflow": semantic_workflow.workflow},
+            config={"workflow": semantic_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         statistical_id = builder.add_node(
             "WorkflowNode",
             node_id="statistical_rag_pipeline",
-            config={"workflow": statistical_workflow.workflow},
+            config={"workflow": statistical_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         hybrid_id = builder.add_node(
             "WorkflowNode",
             node_id="hybrid_rag_pipeline",
-            config={"workflow": hybrid_workflow.workflow},
+            config={"workflow": hybrid_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         hierarchical_id = builder.add_node(
             "WorkflowNode",
             node_id="hierarchical_rag_pipeline",
-            config={"workflow": hierarchical_workflow.workflow},
+            config={"workflow": hierarchical_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         # Quality validator
@@ -185,14 +208,15 @@ result = validate_rag_results(rag_results, analysis)
             },
         )
 
-        # Connect the advanced pipeline
-        builder.add_connection(quality_analyzer_id, "result", router_id, "input")
+        # Connect the advanced pipeline. SwitchNode's primary input port is
+        # `input_data`; each multi-case match emits on `case_<value>`.
+        builder.add_connection(quality_analyzer_id, "result", router_id, "input_data")
 
-        # Connect router to all strategy pipelines
-        builder.add_connection(router_id, semantic_id, route="semantic")
-        builder.add_connection(router_id, statistical_id, route="statistical")
-        builder.add_connection(router_id, hybrid_id, route="hybrid")
-        builder.add_connection(router_id, hierarchical_id, route="hierarchical")
+        # Connect router to all strategy pipelines via the per-case output ports.
+        builder.add_connection(router_id, "case_semantic", semantic_id, "input")
+        builder.add_connection(router_id, "case_statistical", statistical_id, "input")
+        builder.add_connection(router_id, "case_hybrid", hybrid_id, "input")
+        builder.add_connection(router_id, "case_hierarchical", hierarchical_id, "input")
 
         # Connect all pipelines to validator
         builder.add_connection(semantic_id, "output", validator_id, "rag_results")
@@ -216,7 +240,7 @@ class AdaptiveRAGWorkflowNode(WorkflowNode):
     def __init__(
         self,
         name: str = "adaptive_rag_workflow",
-        llm_model: str = "gpt-4",
+        llm_model: Optional[str] = _DEFAULT_LLM_MODEL,
         config: Optional[RAGConfig] = None,
     ):
         self.rag_config = config or RAGConfig()
@@ -281,6 +305,14 @@ Recommend the optimal RAG strategy:""",
 import re
 
 def analyze_for_llm(documents, query=""):
+    # `_content` is a nested local (PythonCodeNode execs the body in a scope
+    # where module-level defs are not visible to nested genexprs). A
+    # present-but-None `content` key returns None from dict.get(..., ""), so
+    # `or ""` is required; non-dict elements are filtered out first.
+    def _content(doc):
+        return (doc.get("content") or "") if isinstance(doc, dict) else ""
+
+    documents = [d for d in (documents or []) if isinstance(d, dict)]
     if not documents:
         return {
             "document_count": 0,
@@ -292,12 +324,12 @@ def analyze_for_llm(documents, query=""):
         }
 
     # Analyze documents
-    total_length = sum(len(doc.get("content", "")) for doc in documents)
+    total_length = sum(len(_content(doc)) for doc in documents)
     avg_length = total_length / len(documents)
 
     # Check for structure
     has_structure = any(
-        any(keyword in doc.get("content", "").lower()
+        any(keyword in _content(doc).lower()
             for keyword in ["# ", "## ", "### ", "heading", "section", "chapter"])
         for doc in documents
     )
@@ -305,7 +337,7 @@ def analyze_for_llm(documents, query=""):
     # Check for technical content
     technical_keywords = ["code", "function", "class", "algorithm", "api", "import", "def ", "return", "variable"]
     is_technical = any(
-        any(keyword in doc.get("content", "").lower()
+        any(keyword in _content(doc).lower()
             for keyword in technical_keywords)
         for doc in documents
     )
@@ -342,12 +374,7 @@ result = analyze_for_llm(documents, query)
             node_id="strategy_executor",
             config={
                 "condition_field": "recommended_strategy",
-                "routes": {
-                    "semantic": "semantic_pipeline",
-                    "statistical": "statistical_pipeline",
-                    "hybrid": "hybrid_pipeline",
-                    "hierarchical": "hierarchical_pipeline",
-                },
+                "cases": ["semantic", "statistical", "hybrid", "hierarchical"],
             },
         )
 
@@ -360,25 +387,25 @@ result = analyze_for_llm(documents, query)
         semantic_pipeline_id = builder.add_node(
             "WorkflowNode",
             node_id="semantic_pipeline",
-            config={"workflow": semantic_workflow.workflow},
+            config={"workflow": semantic_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         statistical_pipeline_id = builder.add_node(
             "WorkflowNode",
             node_id="statistical_pipeline",
-            config={"workflow": statistical_workflow.workflow},
+            config={"workflow": statistical_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         hybrid_pipeline_id = builder.add_node(
             "WorkflowNode",
             node_id="hybrid_pipeline",
-            config={"workflow": hybrid_workflow.workflow},
+            config={"workflow": hybrid_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         hierarchical_pipeline_id = builder.add_node(
             "WorkflowNode",
             node_id="hierarchical_pipeline",
-            config={"workflow": hierarchical_workflow.workflow},
+            config={"workflow": hierarchical_workflow.workflow},  # type: ignore[attr-defined]
         )
 
         # Results aggregator
@@ -399,7 +426,12 @@ def aggregate_adaptive_results(rag_results, llm_decision, preprocessed_data):
             "content_types": preprocessed_data.get("content_types")
         },
         "adaptive_metadata": {
-            "llm_model_used": "gpt-4",
+            # F9 #1126: this dict lives inside a PythonCodeNode codegen
+            # body exec'd in a fresh namespace; the workflows.py
+            # module-scope `_DEFAULT_LLM_MODEL` is NOT visible inside the
+            # exec scope. Emit a documented sentinel; downstream consumers
+            # read the actual model from the upstream LLMAgentNode config.
+            "llm_model_used": "<env-default>",
             "strategy_selection_method": "llm_analysis",
             "fallback_available": llm_decision.get("fallback_strategy")
         }
@@ -410,21 +442,24 @@ result = aggregate_adaptive_results(rag_results, llm_decision, preprocessed_data
             },
         )
 
-        # Connect adaptive pipeline
+        # Connect adaptive pipeline. SwitchNode's primary input port is
+        # `input_data`; each multi-case match emits on `case_<value>`.
         builder.add_connection(preprocessor_id, "result", llm_analyzer_id, "input")
-        builder.add_connection(llm_analyzer_id, "result", executor_id, "input")
+        builder.add_connection(llm_analyzer_id, "result", executor_id, "input_data")
         builder.add_connection(
             preprocessor_id, "result", executor_id, "preprocessed_data"
         )
 
-        # Connect executor to strategy pipelines
-        builder.add_connection(executor_id, semantic_pipeline_id, route="semantic")
+        # Connect executor to strategy pipelines via the per-case output ports.
         builder.add_connection(
-            executor_id, statistical_pipeline_id, route="statistical"
+            executor_id, "case_semantic", semantic_pipeline_id, "input"
         )
-        builder.add_connection(executor_id, hybrid_pipeline_id, route="hybrid")
         builder.add_connection(
-            executor_id, hierarchical_pipeline_id, route="hierarchical"
+            executor_id, "case_statistical", statistical_pipeline_id, "input"
+        )
+        builder.add_connection(executor_id, "case_hybrid", hybrid_pipeline_id, "input")
+        builder.add_connection(
+            executor_id, "case_hierarchical", hierarchical_pipeline_id, "input"
         )
 
         # Connect all pipelines to aggregator
@@ -510,13 +545,7 @@ result = process_config(documents, **kwargs)
             node_id="strategy_dispatcher",
             config={
                 "condition_field": "strategy",
-                "routes": {
-                    "semantic": "semantic_strategy",
-                    "statistical": "statistical_strategy",
-                    "hybrid": "hybrid_strategy",
-                    "hierarchical": "hierarchical_strategy",
-                },
-                "default_route": "hybrid_strategy",
+                "cases": ["semantic", "statistical", "hybrid", "hierarchical"],
             },
         )
 
@@ -533,7 +562,7 @@ result = process_config(documents, **kwargs)
             strategy_id = builder.add_node(
                 "WorkflowNode",
                 node_id=f"{strategy_name}_strategy",
-                config={"workflow": workflow_node.workflow},
+                config={"workflow": workflow_node.workflow},  # type: ignore[attr-defined]
             )
             strategy_ids[strategy_name] = strategy_id
 
@@ -557,13 +586,17 @@ result = format_pipeline_results(strategy_results, processed_config)
             },
         )
 
-        # Connect configurable pipeline
-        builder.add_connection(config_processor_id, "result", dispatcher_id, "input")
+        # Connect configurable pipeline. SwitchNode's primary input port is
+        # `input_data`; each multi-case match emits on `case_<value>` where
+        # `<value>` is the matched `strategy` field value.
+        builder.add_connection(
+            config_processor_id, "result", dispatcher_id, "input_data"
+        )
 
-        # Connect dispatcher to all strategies
+        # Connect dispatcher to all strategies via the per-case output ports.
         for strategy_name, strategy_id in strategy_ids.items():
             builder.add_connection(
-                dispatcher_id, strategy_id, route=f"{strategy_name}_strategy"
+                dispatcher_id, f"case_{strategy_name}", strategy_id, "input"
             )
             builder.add_connection(
                 strategy_id, "output", formatter_id, "strategy_results"

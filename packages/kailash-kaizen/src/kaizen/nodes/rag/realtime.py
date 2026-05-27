@@ -19,12 +19,21 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-from kailash.workflow.builder import WorkflowBuilder
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.code.python import PythonCodeNode
 
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..data.streaming import EventStreamNode
-from ..logic.workflow import WorkflowNode
+# F9 #1120: keep the EventStreamNode import — although `realtime.py` does
+# not reference it directly, importing `kailash.nodes.data.streaming` has
+# the load-bearing SIDE EFFECT of populating `kailash.nodes.data` (which
+# registers `VectorDatabaseNode` used by `kaizen.nodes.rag.strategies`).
+# The smoke test `test_workflownode_subclass_constructs[workflows.*]`
+# regressed when this import was removed in the initial cleanup — the
+# acceptance criterion on issue #1120 explicitly allows keeping the
+# import when it carries a registering side effect.
+from kailash.nodes.data.streaming import EventStreamNode  # noqa: F401
+from kailash.nodes.logic.workflow import WorkflowNode
+from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +103,9 @@ class RealtimeRAGNode(WorkflowNode):
         self.max_buffer_size = max_buffer_size
         self.document_buffer = deque(maxlen=max_buffer_size)
         self.last_update = datetime.now()
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create real-time RAG workflow"""
         builder = WorkflowBuilder()
 
@@ -376,8 +385,13 @@ def format_realtime_results(retrieval_results, query, update_stats):
         self.monitoring_active = True
         self.data_sources = data_sources
 
-        # Start background monitoring task
-        asyncio.create_task(self._monitor_loop())
+        # F9 #1121: retain the task on `self._monitor_task` so (a)
+        # exceptions surface via the awaiter, (b) `stop_monitoring()`
+        # can cancel and await the loop. The prior fire-and-forget made
+        # the task GC-eligible the moment this method returned, hiding
+        # `_monitor_loop` errors and leaving `stop_monitoring` unable
+        # to actually stop the loop.
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
 
         logger.info(f"Started monitoring {len(data_sources)} data sources")
 
@@ -392,16 +406,33 @@ def format_realtime_results(retrieval_results, query, update_stats):
                 # Trigger update
                 self.last_update = datetime.now()
 
+            except asyncio.CancelledError:
+                # F9 #1121: cooperative cancel from stop_monitoring().
+                raise
             except Exception as e:
                 logger.error(f"Monitoring error: {e}")
 
-    def stop_monitoring(self):
-        """Stop monitoring data sources"""
+    async def stop_monitoring(self) -> None:
+        """Stop monitoring data sources.
+
+        F9 #1121: signal the loop AND cancel the retained task so the
+        background loop actually exits (the prior sync method only
+        flipped a flag the loop checked at next `sleep`-tick, leaving
+        the task uncancellable from outside the loop).
+        """
         self.monitoring_active = False
+        task = getattr(self, "_monitor_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
 
 
-@register_node()
-class StreamingRAGNode(Node):
+@register_node(alias="RealtimeStreamingRAGNode")
+class RealtimeStreamingRAGNode(Node):
     """
     Streaming RAG Response Node
 
@@ -414,7 +445,7 @@ class StreamingRAGNode(Node):
     - User experience: Immediate feedback
 
     Example:
-        streaming_rag = StreamingRAGNode()
+        streaming_rag = RealtimeStreamingRAGNode()
 
         async for chunk in streaming_rag.stream(
             query="Latest news on AI",
@@ -439,12 +470,37 @@ class StreamingRAGNode(Node):
         chunk_size: int = 50,
         chunk_interval: int = 100,
     ):
+        super().__init__(
+            name=name,
+            chunk_size=chunk_size,
+            chunk_interval=chunk_interval,
+        )
         self.chunk_size = chunk_size
         self.chunk_interval = chunk_interval
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="streaming_rag",
+                description="Node instance name",
+            ),
+            "chunk_size": NodeParameter(
+                name="chunk_size",
+                type=int,
+                required=False,
+                default=50,
+                description="Tokens per streamed chunk",
+            ),
+            "chunk_interval": NodeParameter(
+                name="chunk_interval",
+                type=int,
+                required=False,
+                default=100,
+                description="Milliseconds between streamed chunks",
+            ),
             "query": NodeParameter(
                 name="query", type=str, required=True, description="Search query"
             ),
@@ -468,6 +524,14 @@ class StreamingRAGNode(Node):
         query = kwargs.get("query", "")
         documents = kwargs.get("documents", [])
         max_chunks = kwargs.get("max_chunks", 10)
+
+        # Initialize chunk_idx so the post-loop `processing_time` reference at
+        # function scope is bound even when `max_chunks == 0` (no iterations).
+        # Same pattern as B9a's audit_logger_id and B9b's coreference_resolver_id.
+        # Sentinel 0 preserves the pre-fix semantic when max_chunks > 0 (loop
+        # binds chunk_idx to its last iteration value) and yields
+        # processing_time = 0 on the max_chunks == 0 edge case.
+        chunk_idx = 0
 
         # Quick initial results
         yield {
@@ -513,17 +577,23 @@ class StreamingRAGNode(Node):
                 "progress": min(100, (end_idx / len(scored_docs)) * 100),
             }
 
-            # Simulate processing time
+            # Simulate processing time. `self.chunk_interval` is canonically
+            # MILLISECONDS (the public docstring on the chunk_interval
+            # constructor kwarg + get_parameters() declaration).
             await asyncio.sleep(self.chunk_interval / 1000)
 
-        # Final metadata
+        # Final metadata. `processing_time` is reported in SECONDS so the
+        # field carries the same unit the asyncio.sleep above counts in
+        # (chunk_interval is ms; chunk_idx chunks × ms / 1000 = seconds).
+        # The prior `chunk_idx * self.chunk_interval` form silently
+        # emitted ms when consumers expected seconds (F9 #1122).
         yield {
             "type": "complete",
             "total_results": len(scored_docs),
             "chunks_sent": min(
                 max_chunks, (len(scored_docs) + self.chunk_size - 1) // self.chunk_size
             ),
-            "processing_time": chunk_idx * self.chunk_interval,
+            "processing_time": chunk_idx * self.chunk_interval / 1000,
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -594,15 +664,40 @@ class IncrementalIndexNode(Node):
         index_type: str = "hybrid",
         merge_strategy: str = "immediate",
     ):
+        super().__init__(
+            name=name,
+            index_type=index_type,
+            merge_strategy=merge_strategy,
+        )
         self.index_type = index_type
         self.merge_strategy = merge_strategy
         self.index = {}
         self.document_store = {}
         self.update_log = deque(maxlen=1000)
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="incremental_index",
+                description="Node instance name",
+            ),
+            "index_type": NodeParameter(
+                name="index_type",
+                type=str,
+                required=False,
+                default="hybrid",
+                description="Type of index (inverted, vector, hybrid)",
+            ),
+            "merge_strategy": NodeParameter(
+                name="merge_strategy",
+                type=str,
+                required=False,
+                default="immediate",
+                description="How to merge incremental updates",
+            ),
             "operation": NodeParameter(
                 name="operation",
                 type=str,
@@ -764,4 +859,4 @@ class IncrementalIndexNode(Node):
 
 
 # Export all real-time nodes
-__all__ = ["RealtimeRAGNode", "StreamingRAGNode", "IncrementalIndexNode"]
+__all__ = ["RealtimeRAGNode", "RealtimeStreamingRAGNode", "IncrementalIndexNode"]

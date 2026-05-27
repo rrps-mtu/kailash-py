@@ -11,12 +11,27 @@ disabled because it does not follow ``__getattr__`` fallbacks.
 
 import warnings
 
+from kailash.events import DomainEvent, EventBus, Subscription
 from kailash.nodes.base import Node, NodeMetadata, NodeParameter
 from kailash.runtime.local import LocalRuntime
 from kailash.workflow.builder import WorkflowBuilder
 
 # Import key components for easier access
 from kailash.workflow.graph import Connection, NodeInstance, Workflow
+
+# isort: split
+# Eagerly register the EventBus workflow node. MUST be imported AFTER the
+# runtime chain above so kailash.runtime.async_local -> kailash.nodes.base_async
+# is fully loaded first. Otherwise:
+#   EventPublishNode -> AsyncNode -> kailash.runtime.template_resolver
+#   -> kailash.runtime.__init__ -> async_local -> AsyncNode
+# triggers a partially-initialized-module ImportError on plain `import kailash`.
+# The `# isort: split` directive above is load-bearing: it tells isort to treat
+# this import as a separate sort block so the alphabetical-order pass does
+# NOT reorder it back before `runtime.local` (which would re-introduce the
+# circular import). Verified by `import kailash` + pre-commit Tier-1
+# collection (issue #1054).
+from kailash.nodes.events import EventPublishNode  # noqa: E402,F401
 
 
 def __getattr__(name):
@@ -80,7 +95,7 @@ def __getattr__(name):
     raise AttributeError(f"module 'kailash' has no attribute {name!r}")
 
 
-__version__ = "2.21.1"
+__version__ = "2.26.2"
 
 __all__ = [
     # Core workflow components
@@ -93,6 +108,10 @@ __all__ = [
     "NodeParameter",
     "NodeMetadata",
     "LocalRuntime",
+    # Domain-event primitive (issue #1054)
+    "EventBus",
+    "Subscription",
+    "DomainEvent",
     # Server classes (lazy, require kailash[server])
     "WorkflowServer",
     "DurableWorkflowServer",
@@ -101,4 +120,24 @@ __all__ = [
     "create_enterprise_gateway",
     "create_durable_gateway",
     "create_basic_gateway",
+    # from_brief() family — Sg-Bootstrap surface (issue #1125 AC 4 + AC 9)
+    "bootstrap",
+    "BootstrapConfig",
 ]
+
+# Eager bind of the bootstrap callable + BootstrapConfig (issue #1125 AC 4 + AC 9).
+# `kailash.bootstrap` is BOTH a submodule name AND the callable name within it; if
+# either symbol resolved through PEP 562 `__getattr__`, the lazy resolver's own
+# `from kailash.bootstrap import bootstrap` import would auto-register the
+# SUBMODULE as `kailash.bootstrap`, shadowing the callable on subsequent access.
+# Eagerly binding here makes `kailash.bootstrap` the CALLABLE (the explicit
+# attribute assignment wins over the submodule's auto-set), while
+# `kailash.bootstrap.bootstrap` (the dotted submodule form) is also still
+# reachable for users who prefer that import path.
+#
+# Safety check: the bootstrap module's top-level imports are pure-Python
+# (dataclasses, typing, logging, os) — NO kaizen at module-import time. Kaizen
+# imports are deferred to call-time inside `_build_agent` and `bootstrap()`.
+# Importing `kailash.bootstrap` here does NOT trigger the kaizen circular-load
+# fence the workflow.from_brief module needs.
+from kailash.bootstrap import BootstrapConfig, bootstrap  # noqa: E402, F401

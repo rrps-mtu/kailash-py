@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kailash"
-version = "2.21.1"
+version = "2.26.2"
 description = "Python SDK for the Kailash container-node architecture"
 authors = [
     {name = "Terrene Foundation", email = "info@terrene.foundation"}
@@ -26,13 +26,17 @@ dependencies = [
     # ─────────────────────────────────────────────────────────────
     # Slim core — only the deps required to `import kailash` and use
     # the workflow primitives (Workflow, WorkflowBuilder, LocalRuntime,
-    # Node, NodeMetadata, NodeParameter). Everything else is opt-in via
-    # extras. See `pip install kailash[server,db-postgres,...]`.
+    # Node, NodeMetadata, NodeParameter) PLUS the kailash.delegate
+    # composition primitive (added in 2.24.0). Everything else is
+    # opt-in via extras. See `pip install kailash[server,db-postgres,...]`.
     #
-    # Audit reference: issue #890. Confirmed by AST closure walk from
-    # `src/kailash/__init__.py` (only 4 eager modules: nodes/base.py,
-    # runtime/local.py, workflow/{builder,graph}.py). Every dep below
-    # has at least one module-scope import in that closure.
+    # Audit reference: issue #890 (pre-Delegate slim-core baseline).
+    # 2.25.1 (#1154) restored the pre-2.24.0 slim-core size by lazy-importing
+    # `filelock` inside `kailash.trust._locking.file_lock()`. The delegate
+    # path now reaches `_locking` for `validate_id` only — no eager filelock.
+    # `filelock` lives in the `[trust]` extra (pyproject.toml § trust below).
+    # Every dep below has at least one module-scope import in the slim-core
+    # closure.
     # ─────────────────────────────────────────────────────────────
     "jsonschema>=4.24.0",   # workflow/contracts.py:21 (Draft7Validator)
     "pydantic>=2.6",        # nodes/base.py:37, workflow/graph.py:12 (BaseModel)

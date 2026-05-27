@@ -14,20 +14,30 @@ Based on RAGAS, BEIR, and evaluation research from 2024.
 
 import json
 import logging
+import os
 import random
 import statistics
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.code.python import PythonCodeNode
+from kailash.nodes.logic.workflow import WorkflowNode
 from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
 from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -90,9 +100,9 @@ class RAGEvaluationNode(WorkflowNode):
     def __init__(
         self,
         name: str = "rag_evaluation",
-        metrics: List[str] = None,
+        metrics: Optional[List[str]] = None,
         use_reference_answers: bool = True,
-        llm_judge_model: str = "gpt-4",
+        llm_judge_model: Optional[str] = _DEFAULT_LLM_MODEL,
     ):
         self.metrics = metrics or [
             "faithfulness",
@@ -102,11 +112,15 @@ class RAGEvaluationNode(WorkflowNode):
         ]
         self.use_reference_answers = use_reference_answers
         self.llm_judge_model = llm_judge_model
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create RAG evaluation workflow"""
         builder = WorkflowBuilder()
+
+        # Bound only inside the optional-branch below; initialize at entry so
+        # the later wiring loop's reference never sees an unbound name.
+        answer_quality_id: Optional[str] = None
 
         # Test executor - runs RAG on test queries
         test_executor_id = builder.add_node(
@@ -152,11 +166,19 @@ def execute_rag_tests(test_queries, rag_system):
             "timestamp": datetime.now().isoformat()
         })
 
-    result = {
+    # F9 umbrella + #1117 sibling: return from function so the module-scope
+    # call below binds `result` (the wire-through happens via the module
+    # namespace, not the function's local scope).
+    return {
         "test_results": test_results,
         "total_tests": len(test_queries),
-        "avg_execution_time": sum(r["execution_time"] for r in test_results) / len(test_results)
+        "avg_execution_time": sum(r["execution_time"] for r in test_results) / len(test_results) if test_results else 0.0
     }
+
+# F9: module-scope call + drop the helper so PythonCodeNode's output gate
+# sees only `result`.
+result = execute_rag_tests(test_queries, rag_system)
+del execute_rag_tests
 """
             },
         )
@@ -257,7 +279,9 @@ def evaluate_context_precision(test_result):
 
     diversity_score = len(unique_terms) / (len(contexts) * 20) if contexts else 0
 
-    result = {
+    # F9 #1117: function MUST return its computed metrics (was bound to
+    # a function-scope `result` local but never returned).
+    return {
         "context_metrics": {
             "precision_at_k": precision_at_k,
             "mrr": mrr,
@@ -266,6 +290,15 @@ def evaluate_context_precision(test_result):
             "context_count": len(contexts)
         }
     }
+
+# F9 #1117: module-scope call. `test_data` is the wire from
+# test_executor.test_results (a LIST). Aggregator expects `context_metrics`
+# to be a LIST; map the per-result evaluation. Then `del` the non-JSON
+# helpers so PythonCodeNode's output-validation gate sees only `result`.
+_test_data = test_data if isinstance(test_data, list) else [test_data]
+context_metrics = [evaluate_context_precision(t).get("context_metrics", {}) for t in _test_data]
+result = {"context_metrics": context_metrics}
+del evaluate_context_precision, _test_data
 """
             },
         )
@@ -309,6 +342,13 @@ import statistics
 def aggregate_evaluation_metrics(test_results, faithfulness_scores, relevance_scores,
                                context_metrics, answer_quality_scores=None):
     '''Aggregate all evaluation metrics'''
+    # F9 #1118: import the datetime CLASS inside the function body —
+    # PythonCodeNode passes separate (globals, locals) to exec() so a
+    # module-scope `from datetime import datetime` rebind binds the alias
+    # into LOCAL namespace and is invisible to this function's closure.
+    # Importing here makes the class lookup resolve cleanly.
+    # (`datetime.now()` on the module raises AttributeError.)
+    from datetime import datetime as _datetime_class
 
     # Parse evaluation results
     all_metrics = {{
@@ -384,27 +424,43 @@ def aggregate_evaluation_metrics(test_results, faithfulness_scores, relevance_sc
     if aggregate_stats.get("execution_time", {{}}).get("mean", 0) > 2.0:
         recommendations.append("Reduce latency: Consider caching or parallel processing")
 
-    result = {{
+    # F9 #1117: function MUST return its aggregate dict (the prior
+    # `result = {{...}}` bound a function-scope local that was never
+    # returned).
+    return {{
         "evaluation_summary": {{
             "aggregate_metrics": aggregate_stats,
             "overall_score": statistics.mean([
                 aggregate_stats.get("faithfulness", {{}}).get("mean", 0),
                 aggregate_stats.get("relevance", {{}}).get("mean", 0),
                 aggregate_stats.get("context_precision", {{}}).get("mean", 0)
-            ]),
+            ]) if aggregate_stats else 0.0,
             "failure_analysis": {{
                 "failure_count": len(failures),
-                "failure_rate": len(failures) / len(test_results),
+                "failure_rate": (len(failures) / len(test_results)) if test_results else 0.0,
                 "failed_queries": failures
             }},
             "recommendations": recommendations,
             "evaluation_config": {{
                 "metrics_used": {self.metrics},
                 "total_tests": len(test_results),
-                "timestamp": datetime.now().isoformat()
+                "timestamp": _datetime_class.now().isoformat()
             }}
         }}
     }}
+
+# F9 #1117: module-scope call. answer_quality_scores is wired in only
+# when self.use_reference_answers=True; defensive try/except so the code
+# is valid in either configuration. `del` non-JSON helpers so
+# PythonCodeNode's output gate sees only `result`.
+try:
+    _aqs = answer_quality_scores
+except NameError:
+    _aqs = None
+result = aggregate_evaluation_metrics(
+    test_results, faithfulness_scores, relevance_scores, context_metrics, _aqs
+)
+del aggregate_evaluation_metrics, _aqs
 """
             },
         )
@@ -421,6 +477,7 @@ def aggregate_evaluation_metrics(test_results, faithfulness_scores, relevance_sc
         )
 
         if self.use_reference_answers:
+            assert answer_quality_id is not None  # narrowed: bound in the branch above
             builder.add_connection(
                 test_executor_id, "test_results", answer_quality_id, "test_data"
             )
@@ -482,15 +539,42 @@ class RAGBenchmarkNode(Node):
     def __init__(
         self,
         name: str = "rag_benchmark",
-        workload_sizes: List[int] = None,
-        concurrent_users: List[int] = None,
+        workload_sizes: Optional[List[int]] = None,
+        concurrent_users: Optional[List[int]] = None,
     ):
-        self.workload_sizes = workload_sizes or [10, 100, 1000]
-        self.concurrent_users = concurrent_users or [1, 5, 10]
-        super().__init__(name)
+        resolved_workload_sizes = workload_sizes or [10, 100, 1000]
+        resolved_concurrent_users = concurrent_users or [1, 5, 10]
+        super().__init__(
+            name=name,
+            workload_sizes=resolved_workload_sizes,
+            concurrent_users=resolved_concurrent_users,
+        )
+        self.workload_sizes = resolved_workload_sizes
+        self.concurrent_users = resolved_concurrent_users
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="rag_benchmark",
+                description="Node instance name",
+            ),
+            "workload_sizes": NodeParameter(
+                name="workload_sizes",
+                type=list,
+                required=False,
+                default=None,
+                description="Document-count workloads to benchmark",
+            ),
+            "concurrent_users": NodeParameter(
+                name="concurrent_users",
+                type=list,
+                required=False,
+                default=None,
+                description="Concurrency levels to benchmark",
+            ),
             "rag_systems": NodeParameter(
                 name="rag_systems",
                 type=dict,
@@ -616,7 +700,9 @@ class RAGBenchmarkNode(Node):
                 statistics.mean(latencies) if latencies else float("inf")
             )
 
-        comparison["fastest_system"] = min(avg_latencies, key=avg_latencies.get)
+        comparison["fastest_system"] = min(
+            avg_latencies, key=lambda k: avg_latencies[k]
+        )
 
         # Find most scalable
         scalability_scores = {}
@@ -631,7 +717,7 @@ class RAGBenchmarkNode(Node):
             )
 
         comparison["most_scalable"] = max(
-            scalability_scores, key=scalability_scores.get
+            scalability_scores, key=lambda k: scalability_scores[k]
         )
 
         # Find most efficient (performance per resource)
@@ -645,7 +731,9 @@ class RAGBenchmarkNode(Node):
             memory = data["resource_usage"]["memory_mb"]
             efficiency_scores[system] = throughput / memory * 1000
 
-        comparison["most_efficient"] = max(efficiency_scores, key=efficiency_scores.get)
+        comparison["most_efficient"] = max(
+            efficiency_scores, key=lambda k: efficiency_scores[k]
+        )
 
         # Generate recommendations
         comparison["recommendations"] = [
@@ -694,15 +782,45 @@ class TestDatasetGeneratorNode(Node):
     def __init__(
         self,
         name: str = "test_dataset_generator",
-        categories: List[str] = None,
+        categories: Optional[List[str]] = None,
         include_adversarial: bool = True,
     ):
-        self.categories = categories or ["factual", "analytical", "comparative"]
+        resolved_categories = categories or [
+            "factual",
+            "analytical",
+            "comparative",
+        ]
+        super().__init__(
+            name=name,
+            categories=resolved_categories,
+            include_adversarial=include_adversarial,
+        )
+        self.categories = resolved_categories
         self.include_adversarial = include_adversarial
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="test_dataset_generator",
+                description="Node instance name",
+            ),
+            "categories": NodeParameter(
+                name="categories",
+                type=list,
+                required=False,
+                default=None,
+                description="Question categories to generate",
+            ),
+            "include_adversarial": NodeParameter(
+                name="include_adversarial",
+                type=bool,
+                required=False,
+                default=True,
+                description="Include adversarial test cases",
+            ),
             "num_samples": NodeParameter(
                 name="num_samples",
                 type=int,

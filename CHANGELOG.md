@@ -7,6 +7,184 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking, delegate substrate)
+
+- **`Connector.authenticate` / `.write` / `.read` default implementations now raise `NotImplementedError`** via `_legacy_unsupported(name)` instead of returning empty-crypto envelopes / `Principal(tenant_id=None)`. Closes GH #1177 (empty-crypto orphan defaults on write/read — downstream verifiers that did not explicitly check `len(signature) > 0` / `len(attestation) > 0` would treat the prior defaults as authenticated/attested) + GH #1178 (`Principal(tenant_id=None)` from the prior `authenticate` default silently slipped through tenant-scoped authorization checks in multi-tenant deployments). The inline defaults were a transitional convenience carried over from the pre-2.26.0 `__init_subclass__` proxy era and were never part of the documented audit-grade contract — `LegacyInvokeConnector` and direct legacy `invoke()`-only subclasses MUST use `.invoke()` for all dispatch; reaching for `.authenticate()` / `.write()` / `.read()` now gets a clear refusal rather than a silent unverifiable envelope. The 3 newer ACCESSOR defaults (`.revocation` / `.ledger` / `.auth_verifier`) already raised via `_legacy_unsupported` since 2.26.0; this change extends the same defense-in-depth pattern to the 3 primitives.
+
+### Migration
+
+- Connector subclasses that need `.authenticate()` / `.write()` / `.read()` MUST implement them explicitly (override with the real cryptographic exchange). The prior inline-default behavior (empty signature / empty attestation / `Principal(tenant_id=None)`) was security-defense-in-depth unsafe and is removed without a deprecation shim — the prior return values were structurally indistinguishable from a real authenticated/attested envelope at the type level, so a `DeprecationWarning` shim would have continued to ship the same defense-in-depth gap during the deprecation window. New-shape connectors that already override the 3 primitives are unaffected.
+- Consumers calling the 3 primitives on a `LegacyInvokeConnector` (or any subclass that does not override them) will now receive `NotImplementedError: Connector primitive 'write' not implemented by this legacy invoke()-only connector — use connector.invoke(...) or migrate the connector to the 4-primitive shape`. Route those call sites through `.invoke(...)`.
+
+## [2.26.2] - 2026-05-25
+
+### Fixed
+
+- **`kailash.delegate` security-hardening sweep — three follow-ups from the 2.26.0 known-issues list** — closes the M1/M3/M4 defense-in-depth gaps the v2.26.0 entry flagged as non-blocking:
+  - **M1 — `DelegateRuntime._consumed` TOCTOU window.** Concurrent `execute()` calls on the same runtime instance both observed `_consumed=False` before either set it, silently violating the §7 TAOD phase monotonicity ("runtime is single-shot per receipt"). Fix: `async with self._consume_lock: asyncio.Lock()` wraps both the check and the set; lock is per-instance, freshly created in `__init__`, and `with_posture()` returns a fresh runtime with a fresh lock (Invariant 5 preserved). Regression test exercises N=10 concurrent `execute()` under `asyncio.gather` and asserts exactly one success; revert-probe verified.
+  - **M3 — `_check_payload_depth` only enumerated `dict` / `list` / `tuple`.** Custom container subclasses (`UserDict`, `UserList`, classes deriving from `collections.abc.Mapping`/`Sequence`/`Set`, frozenset-of-frozensets) bypassed the C6-1 DoS recursion-depth defense — an attacker-crafted payload triggered O(depth) recursion in `canonical_json_dumps` downstream. Fix: replace concrete `isinstance` with `collections.abc.Mapping` + `Sequence` (excluding `str`/`bytes`/`bytearray`) + `Set` (covers `frozenset`, `set`, `dict_keys`, `MappingView`). Regression tests cover UserDict, UserList, abstract Mapping, frozenset, plain set, memoryview exclusion, plain-dict/list regression guards (14 tests total).
+  - **M4 — `_tenant_id_hash` used unsalted SHA-256.** Short tenant IDs (UUIDs, account-ID integers, organization slugs) were rainbow-reversible by log-readers who knew the tenant ID space; the hash leaked into `CascadeTenantIsolationError` messages that surface to cross-tenant error returns and log aggregators. Fix: HMAC-SHA-256 keyed by a per-process salt (`_TENANT_HASH_SALT = secrets.token_bytes(32)`, eager module-init so the import-lock guarantees thread-safety). Salt is per-process (cross-process correlation broken by design, per-process audit correlation preserved); `fork()` workers inherit the parent salt (same-deployment correlation in-scope); `importlib.reload()` rotates (test-infrastructure only); chroot/jail entropy-starved deployments must provision `/dev/urandom` or equivalent (documented). Regression tests include subprocess cross-process unpredictability + `ThreadPoolExecutor(10)` concurrent first-call witness (7 tests total).
+
+### Notes
+
+- Test count: 487 baseline → 512 passed + 1 skipped (+25 new regression tests). Pyright `src/kailash/delegate/ --level error` = 0 errors. `pytest -W error` clean (no DeprecationWarning / ResourceWarning / RuntimeWarning).
+- Convergence: 3-round `/redteam` across 6 parallel agent verdicts (reviewer + security-reviewer + closure-parity in Round 1, security-reviewer + closure-parity in Round 2, security-reviewer + reviewer in Round 3); 2 consecutive clean rounds achieved (R2 + R3). Full receipt: `workspaces/issue-1035-delegate-py/04-validate/10-cycle2-convergence.md`.
+- All three fixes are non-breaking. `DelegateRuntime.execute()` semantics unchanged for single-shot use (the lock only contests concurrent callers). `_check_payload_depth` still raises the same `DispatchValidationError`; coverage now strictly broader. `_tenant_id_hash` still returns an 8-char hex prefix; the value is now non-deterministic across processes by design.
+- Delivered via PR #1170 (cycle-2 hardening + R1 MED follow-ups, 18 commits) — closes the "Known follow-ups" called out in the 2.26.0 release notes for M1 (`_consumed` TOCTOU), M3 (payload-depth subclass coverage), and M4 (unsalted tenant hash).
+
+## [2.26.1] - 2026-05-25
+
+### Fixed
+
+- **`from kailash.delegate import ...` now works on a bare `pip install kailash`** — 2.26.0 shipped `kailash.delegate.verifier` with a module-scope `from cryptography...` import. Because the delegate package is inside the slim-core import closure and `cryptography` lives in the `[trust]`/`[server]` extras (NOT core dependencies), a bare install raised `ModuleNotFoundError: No module named 'cryptography'` on the documented #1035 import line. The cryptography import is now lazy inside `Ed25519Verifier.__init__` — `NullVerifier` (the default) needs no cryptography; `Ed25519Verifier` raises a clear `ModuleNotFoundError` at construction if the `[trust]`/`[server]` extra is absent (the established "loud failure at call site" pattern; matches the #1154 lazy-`filelock` precedent that defends slim-core). Behavioral regression tests (`tests/regression/test_issue_1035_delegate_slim_core_import.py`) assert the slim-core import invariant via subprocess + `sys.modules` introspection.
+
+### Notes
+
+- Corrective patch for 2.26.0 (yanked from PyPI). All 2.26.0 functionality is unchanged — only the cryptography import timing moved from module-scope to lazy. 489 delegate tests pass (487 + 2 new regression).
+
+## [2.26.0] - 2026-05-25
+
+### Added
+
+- **Delegate signature verification — `kailash.delegate.verifier`** — new `Verifier` Protocol, fail-closed `NullVerifier` (rejects all signatures), and `cryptography`-backed `Ed25519Verifier`. Wired into `AuditChainEngine` (verification inside the `_emit_lock` critical section before substrate-anchor append), `TenantScopedCascade` (`cascade_child` + `register_root_grantee` now require a cryptographically-verified `grant_proof`; new `CascadeSignatureError`), and `DelegateRuntime`. Before this release the substrate stored per-event Ed25519 signatures but validated them for hex-shape only — verification is now real. Goes **beyond** the v2.25.x disclosed limitation (issue #1147, which was closed via README disclosure): `PrincipalDirectory` now carries a `verification_keys` registry + `public_key_for()` accessor binding signer IDs to public keys in-primitive.
+- **`Connector` 4-primitive ABC** — `kailash.delegate.dispatch.Connector` rebuilt from a single `invoke()` to the audit-grade shape: required primitives `authenticate` / `write` / `read` plus required accessors `revocation` / `ledger` / `auth_verifier`. Backwards-compatible: existing `invoke()`-only connectors keep working via the `LegacyInvokeConnector` adapter + an `__init_subclass__` auto-proxy.
+- **`LifecycleState.advance_to`** — enforces the single linear delegate lifecycle chain `PROPOSED → INSTANTIATED → POSTURE_GRADED → ACTIVE → RETIRED → ARCHIVED`; illegal edges (skips, backward transitions, post-`ARCHIVED`) raise `LifecycleError`.
+- **#1035 acceptance-gate aliases** — `Delegate`, `ConstraintEnvelope`, `GenesisRecord`, `PostureState`, `AuditChain` exposed as aliases of the disambiguated canonical names (`DelegateRuntime`, `DelegateConstraintEnvelope`, `DelegateGenesisRecord`, `Posture`, `AuditChainEngine`). The literal #1035 import line `from kailash.delegate import Delegate, ConstraintEnvelope, PrincipalDirectory, GenesisRecord, PostureState, AuditChain, Connector` now resolves. Both forms are the same class object at runtime; new code should prefer the prefixed names to avoid collision with `kaizen_agents.delegate.Delegate`.
+
+### Notes
+
+- **Backwards-compatible (minor).** No existing public import or connector breaks. `DispatchSurface(verifier=...)` defaults to `None` (verification skipped) to preserve existing callers — strict-security deployments MUST bind `NullVerifier` or `Ed25519Verifier` explicitly. A future major may flip the default to fail-closed once callers migrate.
+- **Cross-implementation byte-match receipts vs kailash-rs are DEFERRED** per `cross-sdk-inspection.md` Rule 4 — the rs-side Ed25519 library is unconfirmed in-tree; ≥3 byte-vector test cases will be pinned when rs publishes its canonical. The comparator-behavior contract (`receipts_agree`) is exercised end-to-end today; only the rs-vendored byte canonical is pending.
+- **Known follow-ups (non-blocking, tracked):** `DelegateRuntime.advance_lifecycle` runtime wrapper is defined but unwired pending the `Delegate.compose()` composer (the production hot path uses the separate, fully-wired TAOD `state` axis); `_tenant_id_hash` is unsalted SHA-256; `DispatchSurface._consumed` has a narrow concurrent-execute TOCTOU window.
+- Delivered via PR #1164 (3-shard parallel `/redteam`-to-convergence cycle — Round 1: 6 CRITICAL + 5 HIGH; two consecutive clean verification rounds) plus PR #1165 (R1 reconciliation — docstring accuracy, signer-contract tightening, `verifier.py` import-safety). 487 delegate tests pass (+69 over the v2.25.2 baseline).
+
+## [2.25.2] - 2026-05-23
+
+### Documentation
+
+- **CHANGELOG correction for v2.25.0 (continued, 4th inaccuracy) — audit-chain forensic key-registry gap NOT closed in 2.25.0** — the v2.25.1 entry corrected three inaccuracies in the v2.25.0 prose; a fourth was missed. The v2.25.0 entry (lines 37 + 45) claims "the audit-chain forensic gap was the only deferred item that flipped status this release (PR #1155)" and "With 2.25.0, the audit-chain forensic key-registry gap (previously deferred) is closed." Both statements are **incorrect**:
+  - PR #1146 closed the H1 **grantee** registry gap (`TenantScopedCascade.__grantees` + `register_root_grantee()`), not the audit-chain forensic key registry. The two gaps are distinct.
+  - The audit-chain forensic key-registry gap remains **open**, tracked at [issue #1147](https://github.com/terrene-foundation/kailash-py/issues/1147). `README.md` § "Delegate composition primitive — Pre-Pledge v0" correctly discloses this: `AuditChainEntry` stores per-event Ed25519 signatures, but the primitive does NOT bind signer keys to a public-key registry, fingerprint, or key-rotation epoch. Out-of-band identity-to-key binding is required; operators MUST provide their own attestation surface.
+  - Per `git.md` no-amend rule, the v2.25.0 prose is preserved in git history; this entry corrects the public-facing disclosure record. The v2.25.1 corrections for `PrincipalKind`-type, valid-values, and `UnregisteredGranteeError` stand.
+
+### Notes
+
+This is a structural follow-up patch correcting the public-facing release-notes record for v2.25.0. No code changes; no public API changes; no behavior change. All v2.25.0 functionality (`PrincipalKind` discrimination, grantee-registry enforcement, audit-chain E2E tests) ships unchanged from v2.25.1.
+
+## [2.25.1] - 2026-05-23
+
+### Fixed
+
+- **Slim-core install budget — lazy-import `filelock` in `trust/_locking.py` (#1154)** — `kailash.trust._locking::file_lock()` is now the sole filelock consumer and lazy-imports `from filelock import FileLock, Timeout` inside the function body. This breaks the `kailash.delegate.types → kailash.trust._locking → filelock` eager-import chain that the 2.24.1 hotfix worked around by promoting `filelock>=3.0` into slim-core `[project.dependencies]`. With #1154 landed, `filelock>=3.0` is removed from slim-core and returned to the `[trust]` extra. `pip install kailash` (bare) no longer pulls filelock; `pip install kailash[trust]` continues to install it as before. `validate_id` is still the canonical path-traversal guard (`trust-plane-security.md` Rule 2). 3 regression tests pin the invariants: (a) `from kailash.trust._locking import validate_id` does not load filelock into `sys.modules`; (b) `import kailash.delegate.types` does not load filelock; (c) `file_lock(...)` still works end-to-end when filelock is installed.
+
+### Documentation
+
+- **CHANGELOG correction for v2.25.0** — the 2.25.0 entry has three inaccuracies in its prose (the shipped code IS correct; only the release notes mis-described it). For accurate reference:
+  - `PrincipalKind` is a `typing.Literal["sovereign", "service_account", "delegate"]` type alias — NOT a `Python Enum`.
+  - The valid `principal_kind` values are `"sovereign"`, `"service_account"`, `"delegate"` — NOT `"human"`, `"agent"`, `"service"`.
+  - H1 grantee-registry enforcement raises the **pre-existing** `DispatchCascadeViolationError` — no new `UnregisteredGranteeError` class was added. The H1 wave added `TenantScopedCascade.grantees` (property) and `TenantScopedCascade.register_root_grantee()` (method); the error class itself was already part of the public surface in 2.24.0.
+
+### Notes
+
+This is a structural follow-up patch closing #1154 (queued from 2.24.1 hotfix). The slim-core size budget is restored to its pre-2.24.0 baseline. No public API changes; all 2.25.0 functionality (PrincipalKind discrimination, grantee-registry enforcement, audit-chain E2E tests) ships unchanged.
+
+## [2.25.0] - 2026-05-23
+
+### Added
+
+- **`kailash.delegate.types.PrincipalKind` — §10 G1 principal-kind discrimination (#1143)** — new `PrincipalKind` enum (`Enum["human", "agent", "service"]`) added to `DelegateIdentity` + `Role` discriminator on the public API. `DispatchSurface.bind()` and `dispatch()` now cross-validate `principal_kind` at construction (capability snapshot) AND at dispatch time (re-check on rebind) per the §10 G1 conformance vector DV-10-001. `PrincipalKind` is exported in `kailash.delegate.__all__` and pinned by count tests. DV-10-001 vector is no longer xfail-strict — it runs natively (PR #1157).
+- **`TenantScopedCascade` grantee registry — H1 forensic key-tracking gap closure (#1146)** — `TenantScopedCascade` now carries a name-mangled `__grantees` registry (accessed via `_TenantScopedCascade__grantees`) of every grantee identity bound through `grant_to(...)`. `DispatchSurface.dispatch()` enforces the registry: a dispatch whose grantee identity was not previously enrolled raises `UnregisteredGranteeError` at gate order position 3 (lifecycle → principal_kind → grantee → capability). Closes the H1 holistic-/redteam follow-up disclosed in v2.24.0 README § "Pre-Pledge v0 status". Trust-boundary documented in class docstring; access is structurally guarded by Python name-mangling so external mutation requires the mangled form, never plain `cascade._grantees` (which raises `AttributeError`) (PR #1158).
+- **D2 audit-chain hash-linkage E2E replay + D3 DV-5-001 runtime-end-to-end vector test (#1149, #1150)** — `tests/e2e/delegate/test_delegate_e2e_flows.py` extended with audit-chain hash-linkage replay assertions (D2: every emitted audit row chains to the prior row's hash byte-identically across replay) and DV-5-001 runtime end-to-end vector test exercising the full TAOD lifecycle through cascade-layer dispatch (D3). E2E flow A (happy path) now asserts cascade-layer redaction firing on widening reads (PR #1156).
+
+### Documentation
+
+- **S5 capability re-check site + audit-chain forensic key registry gap disclosure (#1147, #1148)** — README § "Delegate composition primitive — Pre-Pledge v0" clarified to name the S5 capability re-check site as `DispatchSurface.dispatch()` (the per-call re-check that catches post-construction state mutations) AND disclose the audit-chain forensic key-registry gap as a deferred item (now closed in 2.25.0 via #1146). README's "deferred items" enumeration updated; the audit-chain forensic gap was the only deferred item that flipped status this release (PR #1155).
+
+### Notes
+
+This release closes 6 of the holistic-/redteam follow-up issues filed at v2.24.0 (#1143, #1146, #1147, #1148, #1149, #1150 — six issues across four PRs). Two follow-ups remain tracked for future patches: #1086 (cross-SDK rs parity for `PrincipalKind` + grantee registry — blocked on cross-repo authorization per `repo-scope-discipline.md`) and #1154 (slim-core install budget restoration — lazy-import `filelock` in `trust/_locking.py`). Semver minor because `PrincipalKind` is a new public symbol in `kailash.delegate.__all__` and `UnregisteredGranteeError` extends the public exception surface; no breaking changes to existing public API.
+
+### Pre-Pledge v0 status
+
+`kailash.delegate` remains at pre-pledge v0. With 2.25.0, the audit-chain forensic key-registry gap (previously deferred) is closed; the 8 enforced invariants from 2.24.0 expand to include §10 G1 principal-kind discrimination and H1 grantee-registry enforcement. Two items remain explicitly deferred: cross-SDK byte-determinism conformance for vectors DV-3/DV-7/DV-9 (py-leads through 2.25.0; rs leadership pending), and the slim-core install budget restoration (#1154). Three explicit non-promises continue: no implicit retries, no shadow audit chains, no posture auto-upgrade. See README § "Delegate composition primitive — Pre-Pledge v0" for the full updated disclosure.
+
+## [2.24.1] - 2026-05-22
+
+### Fixed
+
+- **`import kailash.delegate` failed on clean-venv install of 2.24.0 (CRITICAL)** — `kailash.delegate.types:46` eagerly imports `from kailash.trust._locking import validate_id` (the canonical path-traversal guard mandated by `trust-plane-security.md` Rule 2); `kailash.trust._locking:38` has a module-scope `from filelock import FileLock, Timeout`; `filelock` was declared only in the `[trust]` optional extra, not in core dependencies. Result: `pip install kailash==2.24.0` → `from kailash import delegate` → `ModuleNotFoundError: No module named 'filelock'`. Fixed by promoting `filelock>=3.0` to slim-core `[project.dependencies]` (duplicates the `[trust]` declaration so a bare install resolves delegate cleanly). Same failure class as `build-repo-release-discipline.md` Rule 2 "clean-venv installability is the done gate" + `deployment.md` "MUST: Eagerly-Imported Transitive Dependencies Are Declared By The Importing Package".
+
+## [2.24.0] - 2026-05-22
+
+### Added
+
+- **`kailash.delegate` composition primitive — pre-pledge v0 (#1035)** — new public top-level module shipping the (Connector × Signature × ConstraintEnvelope × Executor) composition substrate under EATP audit. 8-shard build (S1-S8 over PRs #1130-#1144 + L1 cleanup #1145):
+  - **S1 fences** — module + `kailash.delegate` namespace, Apache-2.0 license declaration, zero-engine-deps pre-commit fence (#1130).
+  - **S2 + S2.5 canonical types** — substrate dataclasses, F5 type-state monotonic envelope (#1136 + #1131).
+  - **S3 trust cascade** — `TenantScopedCascade`, `GrantMoment`, signed cascade chain (#1137).
+  - **S4 audit chain** — `AuditChainEngine`, `WitnessedCrossAnchor`, signed audit row emission (#1137).
+  - **S5 dispatch + Connector ABC** — `Connector` abstract base, `DispatchSurface`, `DispatchResult`, capability snapshot at construction, strict-type guard, 32-depth + 1MiB payload limits (#1138).
+  - **S6 runtime spine** — `DelegateRuntime`, `TAODState`/`TAODTransition` (Think-Act-Observe-Decide lifecycle), `Posture` enum (L1-L5 + HALT) with rank ladder, `R2Composition` validator with `is`-identity checks, `RuntimeExecutionResult` with lossy `to_dict`/`from_dict` (commits `bdc89a9b4`, `5fcf935db`, `e9626a223` for S6 R1 audit-emit-before-state-advance + no-recurse `_advance_to_failed_no_audit` helper).
+  - **S7 conformance schema** — `ConformanceVector`, `ConformanceVectorLoader.load_canonical()` with SHA-256 integrity check, `ConformanceVectorIntegrityError` tamper detection, `ConformanceReceipt` with `to_dict`/`from_dict`, `receipts_agree(rs, py)` cross-impl comparator with timestamp-exclusion, `assert_receipts_agree()`. 5 canonical vectors at `tests/fixtures/delegate-conformance/canonical.json` (DV-3-001, DV-5-001, DV-7-001, DV-9-001, DV-10-001). DV-5-001 + DV-10-001 vendored byte-for-byte from `terrene-foundation/kailash-rs` per cross-SDK fixture-vendoring discipline. §7 TAOD phase monotonicity enforced at runtime via `self._consumed` guard + try/finally (commit `d4ad6a9b3`).
+  - **S8 E2E + cross-impl receipts + pre-pledge README** — 8 end-to-end flows (Flow A happy path, B posture HALT, C tenant violation, C2 surface invariant, D signer failure no-recurse, E §7 single-shot, F ConformanceVectorLoader, G receipts_agree_dict identity); 3 Tier-2 cross-impl tests; README § "Delegate composition primitive — Pre-Pledge v0" disclosure enumerating 8 enforced invariants + 3 deferred items + 3 non-promises + how-to-verify + status.
+- **Holistic post-multi-wave /redteam** across all 8 shards on main caught 1 L1 (workspace-path-leakage scrub in module docstrings, PR #1145) + 5 cross-shard follow-ups filed as #1146-#1150 — none blocking v2.24.0.
+
+### Pre-Pledge v0 status
+
+`kailash.delegate` is shipped at pre-pledge v0 per the README disclosure section. Users may rely on the 8 enforced invariants (signed audit chain, capability snapshot at construction, posture ladder, single-shot §7 phase monotonicity, etc.) at this version. Three items remain explicitly deferred to a future minor: cross-SDK byte-determinism conformance for vectors DV-3/DV-7/DV-9 (py-leads at v2.24.0; rs leadership pending). Three explicit non-promises: no implicit retries, no shadow audit chains, no posture auto-upgrade. See README § "Delegate composition primitive — Pre-Pledge v0" for the full disclosure.
+
+### Notes
+
+This release ships a brand-new public top-level module (`kailash.delegate`), warranting SemVer minor. No breaking changes to existing public surfaces. The 6 holistic-/redteam follow-up issues (#1143, #1146-#1150) are tracked separately and will close as their respective fixes land in v2.24.x patches.
+
+## [2.23.0] - 2026-05-19
+
+### Changed
+
+- **Node-registry cross-module collision guard (#891)** — `NodeRegistry.register`
+  now raises `NodeConfigurationError` when a node name is re-registered by a
+  class from a different source file. Previously such collisions only emitted an
+  INFO log and the last import silently won, so `add_node("<name>")` resolved
+  import-order-dependently. Same-module re-registration (DataFlow model
+  decoration regenerating CRUD node classes per `@db.model`) stays non-fatal
+  per ADR-002.
+- **`BulkUpsertNode` renamed to `SQLBulkUpsertNode` (#891)** — the core bulk
+  upsert node registered the same global name as kailash-dataflow's
+  `BulkUpsertNode`. Migration: `add_node("BulkUpsertNode", ...)` →
+  `add_node("SQLBulkUpsertNode", ...)`.
+
+## [2.22.1] - 2026-05-18
+
+### Fixed
+
+- **`import kailash` failed on clean-venv install of 2.22.0 (CRITICAL)** — an `EventPublishNode` circular import surfaced on every fresh `pip install kailash==2.22.0`; resolved by an isort-driven split of the import block in `src/kailash/__init__.py`. No API change. Catch-up patch for a fix that landed on `main` after the 2.22.0 release tag (`build-repo-release-discipline.md` Rule 2 — clean-venv installability is the done gate).
+
+## [2.22.0] - 2026-05-18
+
+### Added
+
+- **`kailash.EventBus` domain-event primitive with pluggable backends (#1054)** — new public surface for in-process and broker-backed event publication. Exports: `EventBus`, `Subscription`, `DomainEvent`, `EventPublishNode`. Backends: `InMemoryEventBackend` (default, zero external dep) and `RedisStreamsEventBackend` (behind the existing `[redis]` optional extra). Backend selectable via constructor `backend=` arg or `KAILASH_EVENTBUS_BACKEND` env var (closed-list lookup, no arbitrary-import vector). `publish` + `subscribe` API supports `correlation_id` for trace propagation (auto-generated via `uuid.uuid4()` when omitted, round-trips to subscriber). `EventPublishNode` integrates publication into `WorkflowBuilder` steps. Type stub (`.pyi`) + `py.typed` marker shipped. Tier-2 round-trip suite at `tests/integration/events/test_eventbus_wiring.py` (16 passed + 1 documented xfail for live Redis). Fixes #1054.
+
+### Fixed
+
+- **`@app.handler()` decorator no longer emits the SDK's own instance-API advisory (#1071 Gap B)** — the decorator's internal `make_handler_workflow` registers via `WorkflowBuilder.add_node_instance`, which historically warned the consumer about instance-API misuse — once per registered handler, scaling to hundreds of spurious `UserWarning`s per process for correct decorator use. Added keyword-only `_internal: bool = False` flag to `_add_node_instance` and `add_node_instance`; `make_handler_workflow` passes `_internal=True`. Genuine consumer instance-API misuse never sets the flag and still warns. `_internal` is keyword-only (after `*`) so a positional `True` cannot accidentally suppress the warning. Fixes #1071 Gap B.
+
+## [2.21.3] - 2026-05-18
+
+### Fixed
+
+- **`SQLiteAdapter` transaction state not reset on aborted `begin_transaction()` (#1070)** — `asyncio.CancelledError` is a `BaseException`, not an `Exception`; the auto-transaction wrappers caught `except Exception:`, so a coroutine cancelled between `begin_transaction()` and `commit_transaction()` skipped `rollback_transaction()`, leaving `_transaction_depth` unreset. The next `begin_transaction()` on the shared `:memory:` connection then took a poisoned SAVEPOINT branch (reproduced: an aborted transaction's uncommitted row leaked into the next transaction). Added `_abort_begin()` (resets depth/savepoint-counter + `ROLLBACK`, never closes the `:memory:` connection) and switched both auto-transaction wrappers to `except BaseException:`. Fixes #1070.
+
+### Documentation
+
+- Documented the constant-time-comparison expectation for caller-supplied `JWTConfig.api_key_validator` (docstring + `specs/security-auth.md` §2.2; no behavior change). Fixes #1068.
+
+## [2.21.2] - 2026-05-18
+
+### Fixed
+
+- **aiosqlite `:memory:` connection leaked on `DataFlow`/`ProtectedDataFlow` `close()` (#1051)** — multi-sited fix: untracked per-query `:memory:` connection is now reused and closed; `ProductionSQLiteAdapter.disconnect` handles both branches; node `_owned_adapters` teardown; engine cached-node teardown resolved `cleanup()` vs the dead `hasattr(close)` guard. Fixes #1051.
+
 ## [2.21.1] - 2026-05-16
 
 ### Fixed

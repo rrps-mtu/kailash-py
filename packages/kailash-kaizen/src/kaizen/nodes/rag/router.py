@@ -6,13 +6,22 @@ Includes LLM-powered strategy selection and performance monitoring.
 """
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+
 from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
 
 logger = logging.getLogger(__name__)
+
+# Default routing model resolved from the environment (.env is the single
+# source of truth — never hardcode model names). May be None when unset;
+# that is env-models-compliant and acceptable as a default.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -27,16 +36,41 @@ class RAGStrategyRouterNode(Node):
     def __init__(
         self,
         name: str = "rag_strategy_router",
-        llm_model: str = "gpt-4",
+        llm_model: Optional[str] = _DEFAULT_LLM_MODEL,
         provider: str = "openai",
     ):
+        super().__init__(
+            name=name,
+            llm_model=llm_model,
+            provider=provider,
+        )
         self.llm_model = llm_model
         self.provider = provider
         self.llm_agent = None
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="rag_strategy_router",
+                description="Node instance name",
+            ),
+            "llm_model": NodeParameter(
+                name="llm_model",
+                type=str,
+                required=False,
+                default=_DEFAULT_LLM_MODEL,
+                description="LLM model for routing analysis",
+            ),
+            "provider": NodeParameter(
+                name="provider",
+                type=str,
+                required=False,
+                default="openai",
+                description="LLM provider for routing analysis",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -70,10 +104,14 @@ class RAGStrategyRouterNode(Node):
         user_preferences = kwargs.get("user_preferences", {})
         performance_history = kwargs.get("performance_history", {})
 
-        # Initialize LLM agent if needed
+        # Initialize LLM agent if needed.
+        # Use `self.metadata.name` (Node base stores name on metadata, not as
+        # a bare attribute — `self.name` raised AttributeError on every call
+        # before this fix, the resurrection false-floor pattern A3-triage
+        # flagged at router.py:102).
         if not self.llm_agent:
             self.llm_agent = LLMAgentNode(
-                name=f"{self.name}_llm",
+                name=f"{self.metadata.name}_llm",
                 model=self.llm_model,
                 provider=self.provider,
                 system_prompt=self._get_strategy_selection_prompt(),
@@ -451,10 +489,17 @@ class RAGQualityAnalyzerNode(Node):
     """
 
     def __init__(self, name: str = "rag_quality_analyzer"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="rag_quality_analyzer",
+                description="Node instance name",
+            ),
             "rag_results": NodeParameter(
                 name="rag_results",
                 type=dict,
@@ -494,6 +539,18 @@ class RAGQualityAnalyzerNode(Node):
             "max_score": max(scores) if scores else 0.0,
             "score_variance": self._calculate_variance(scores) if scores else 0.0,
         }
+
+        # Expected-results comparison (documented kwarg per
+        # get_parameters() — Rule 3c: every documented kwarg MUST be
+        # consumed by ≥1 branch). When the caller supplies expected
+        # results, surface the comparison so downstream consumers can
+        # compute precision/recall against the retrieval.
+        if expected_results:
+            expected_count = len(expected_results)
+            quality_analysis["expected_result_count"] = expected_count
+            quality_analysis["expected_recall_ratio"] = (
+                min(len(documents) / expected_count, 1.0) if expected_count else 0.0
+            )
 
         # Content quality analysis
         content_analysis = self._analyze_content_quality(documents, query)
@@ -665,11 +722,18 @@ class RAGPerformanceMonitorNode(Node):
     """
 
     def __init__(self, name: str = "rag_performance_monitor"):
+        super().__init__(name=name)
         self.performance_history = []
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="rag_performance_monitor",
+                description="Node instance name",
+            ),
             "rag_results": NodeParameter(
                 name="rag_results",
                 type=dict,

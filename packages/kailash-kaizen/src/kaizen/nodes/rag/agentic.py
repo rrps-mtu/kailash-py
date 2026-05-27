@@ -11,21 +11,33 @@ Implements RAG with autonomous agent capabilities:
 Based on ReAct, Toolformer, and agent research from 2024.
 """
 
-import json
 import logging
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Union
+import os
+from typing import Any, Callable, Dict, List, Optional
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+
+# PythonCodeNode is imported for its @register_node side effect: the
+# sub-workflows below reference it by the string "PythonCodeNode", so its
+# class must be registered before _create_workflow() runs.
+from kailash.nodes.code.python import PythonCodeNode  # noqa: F401
+from kailash.nodes.logic.workflow import WorkflowNode
 from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
-from ..ai.llm_agent import LLMAgentNode
-from ..api.rest import RESTClientNode
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..data.sql import SQLDatabaseNode
-from ..logic.workflow import WorkflowNode
+# LLMAgentNode is imported for its @register_node side effect: the
+# sub-workflows reference it by the string "LLMAgentNode".
+from ..ai.llm_agent import LLMAgentNode  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -84,7 +96,7 @@ class AgenticRAGNode(WorkflowNode):
     def __init__(
         self,
         name: str = "agentic_rag",
-        tools: List[str] = None,
+        tools: Optional[List[str]] = None,
         max_reasoning_steps: int = 5,
         planning_strategy: str = "react",
         verification_enabled: bool = True,
@@ -93,9 +105,9 @@ class AgenticRAGNode(WorkflowNode):
         self.max_reasoning_steps = max_reasoning_steps
         self.planning_strategy = planning_strategy
         self.verification_enabled = verification_enabled
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create agentic RAG workflow"""
         builder = WorkflowBuilder()
 
@@ -122,7 +134,7 @@ Return JSON:
     "complexity": "simple|moderate|complex",
     "estimated_steps": 3
 }}""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -149,7 +161,7 @@ End with:
 Answer: [final comprehensive answer]
 
 Maximum steps: {self.max_reasoning_steps}""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -158,7 +170,7 @@ Maximum steps: {self.max_reasoning_steps}""",
             "PythonCodeNode",
             node_id="tool_executor",
             config={
-                "code": """
+                "code": r"""
 import re
 import json
 from datetime import datetime
@@ -181,8 +193,12 @@ def execute_tool(action_string, documents, context):
         search_results = []
 
         for doc in documents[:50]:  # Limit for performance
-            content = doc.get("content", "").lower()
-            title = doc.get("title", "").lower()
+            if not isinstance(doc, dict):
+                continue  # skip malformed non-dict document elements
+            # `.get("content", "")` only defaults a MISSING key; a present
+            # key with a None value would still yield None, so coerce.
+            content = (doc.get("content") or "").lower()
+            title = (doc.get("title") or "").lower()
 
             # Score based on word overlap
             doc_words = set(content.split())
@@ -211,73 +227,67 @@ def execute_tool(action_string, documents, context):
         }
 
     elif tool_name == "calculate":
-        # Safe calculation
-        try:
-            # Only allow basic math operations
-            safe_dict = {"__builtins__": None}
-            safe_dict.update({
-                "abs": abs, "round": round, "min": min, "max": max,
-                "sum": sum, "len": len, "pow": pow
-            })
+        # Safe calculation — AST-walked arithmetic only. `params` is
+        # LLM-generated; eval()/regex-substitution sandboxes are bypassable, so
+        # this whitelists ast node types instead (no eval, no exec, no regex).
+        import ast
+        import math
+        import operator
 
-            # Enterprise security: Use ast.literal_eval for safe mathematical expressions
-            import ast
+        _BINOPS = {
+            ast.Add: operator.add, ast.Sub: operator.sub,
+            ast.Mult: operator.mul, ast.Div: operator.truediv,
+            ast.Pow: operator.pow, ast.Mod: operator.mod,
+            ast.FloorDiv: operator.floordiv,
+        }
+        _UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+        _FUNCS = {
+            "abs": abs, "round": round, "min": min, "max": max, "pow": pow,
+            "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+            "tan": math.tan, "log": math.log, "exp": math.exp,
+        }
+        _CONSTS = {"pi": math.pi, "e": math.e}
+
+        def _safe_arith(node):
+            if isinstance(node, ast.Expression):
+                return _safe_arith(node.body)
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                    return node.value
+                raise ValueError("non-numeric constant")
+            if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+                return _BINOPS[type(node.op)](
+                    _safe_arith(node.left), _safe_arith(node.right)
+                )
+            if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARYOPS:
+                return _UNARYOPS[type(node.op)](_safe_arith(node.operand))
+            if isinstance(node, ast.Name) and node.id in _CONSTS:
+                return _CONSTS[node.id]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _FUNCS
+                and not node.keywords
+            ):
+                return _FUNCS[node.func.id](
+                    *[_safe_arith(a) for a in node.args]
+                )
+            raise ValueError("disallowed expression element")
+
+        try:
             try:
-                # Try ast.literal_eval first for simple mathematical expressions
                 result = ast.literal_eval(params)
             except (ValueError, SyntaxError):
-                # Fallback to safe mathematical evaluation
-                import operator
-                import math
-
-                # Define safe operators and functions
-                safe_ops = {
-                    '+': operator.add,
-                    '-': operator.sub,
-                    '*': operator.mul,
-                    '/': operator.truediv,
-                    '**': operator.pow,
-                    'abs': abs,
-                    'max': max,
-                    'min': min,
-                    'round': round,
-                    'sqrt': math.sqrt,
-                    'sin': math.sin,
-                    'cos': math.cos,
-                    'tan': math.tan,
-                    'log': math.log,
-                    'exp': math.exp,
-                    'pi': math.pi,
-                    'e': math.e,
-                }
-                safe_ops.update(safe_dict)
-
-                # Parse and evaluate safely
-                try:
-                    # Simple expression parser for basic math
-                    import re
-                    # Replace function calls and operators with safe alternatives
-                    safe_expr = params
-                    for func in ['sqrt', 'sin', 'cos', 'tan', 'log', 'exp']:
-                        safe_expr = re.sub(rf'\b{func}\(([^)]+)\)', rf'safe_ops["{func}"](\1)', safe_expr)
-
-                    # Only evaluate if it's a simple mathematical expression
-                    if re.match(r'^[0-9+\-*/.() \w]+$', safe_expr.replace('safe_ops', '')):
-                        result = eval(safe_expr, {"__builtins__": {}}, {"safe_ops": safe_ops})
-                    else:
-                        result = f"Cannot evaluate complex expression: {params}"
-                except Exception:
-                    # Fallback for invalid expressions (sandboxed - no logging available)
-                    result = f"Invalid mathematical expression: {params}"
+                result = _safe_arith(ast.parse(params, mode="eval"))
             results = {
                 "tool": "calculate",
                 "expression": params,
-                "result": result
+                "result": result,
             }
-        except Exception as e:
+        except Exception:
             results = {
                 "tool": "calculate",
-                "error": str(e)
+                "error": f"Cannot evaluate expression: {params}",
             }
 
     elif tool_name == "database":
@@ -424,6 +434,7 @@ result = {{
         )
 
         # Verification agent (if enabled)
+        verifier_id: Optional[str] = None
         if self.verification_enabled:
             verifier_id = builder.add_node(
                 "LLMAgentNode",
@@ -444,16 +455,19 @@ Return JSON:
     "issues": ["list of any issues found"],
     "suggestions": ["improvements if needed"]
 }""",
-                    "model": "gpt-4",
+                    "model": _DEFAULT_LLM_MODEL,
                 },
             )
 
         # Result synthesizer
+        # NB: this code template is an f-string because the metadata block
+        # interpolates the constructor config (planning_strategy / max steps).
+        # Literal Python braces inside the sandboxed code are doubled ({{ }}).
         synthesizer_id = builder.add_node(
             "PythonCodeNode",
             node_id="result_synthesizer",
             config={
-                "code": """
+                "code": f"""
 # Synthesize final results
 reasoning_state = reasoning_state
 verification = verification if "verification" in locals() else None
@@ -476,7 +490,7 @@ if verification and verification.get("response"):
             verification_data = json.loads(verification_data)
         except Exception:
             # Fallback for invalid JSON (sandboxed - no logging available)
-            verification_data = {"confidence": 0.8}
+            verification_data = {{"confidence": 0.8}}
 
     verification_confidence = verification_data.get("confidence", 0.8)
     final_confidence = (base_confidence + confidence_boost) * verification_confidence
@@ -486,16 +500,16 @@ else:
 # Build reasoning trace
 reasoning_trace = []
 for step in reasoning_state["steps"]:
-    trace_entry = {
+    trace_entry = {{
         "step": step["step_number"],
         "thought": step["thought"],
         "action": step["action"],
         "observation": step["observation"]
-    }
+    }}
     reasoning_trace.append(trace_entry)
 
-result = {
-    "agentic_rag_result": {
+result = {{
+    "agentic_rag_result": {{
         "query": query,
         "answer": reasoning_state["final_answer"],
         "reasoning_trace": reasoning_trace,
@@ -503,13 +517,13 @@ result = {
         "confidence": final_confidence,
         "total_steps": len(reasoning_state["steps"]),
         "verification": verification.get("response") if verification else None,
-        "metadata": {
+        "metadata": {{
             "planning_strategy": "{self.planning_strategy}",
             "max_steps": {self.max_reasoning_steps},
             "completed_successfully": reasoning_state["completed"]
-        }
-    }
-}
+        }}
+    }}
+}}
 """
             },
         )
@@ -539,6 +553,9 @@ result = {
 
         # Verification (if enabled)
         if self.verification_enabled:
+            # verifier_id was assigned in the matching `if` block above; the
+            # assert documents that invariant and narrows the type for pyright.
+            assert verifier_id is not None
             builder.add_connection(
                 state_manager_id, "reasoning_state", verifier_id, "answer_to_verify"
             )
@@ -590,15 +607,41 @@ class ToolAugmentedRAGNode(Node):
     def __init__(
         self,
         name: str = "tool_augmented_rag",
-        tool_registry: Dict[str, Callable] = None,
+        tool_registry: Optional[Dict[str, Callable]] = None,
         auto_detect_tools: bool = True,
     ):
-        self.tool_registry = tool_registry or {}
+        resolved_registry = tool_registry or {}
+        super().__init__(
+            name=name,
+            tool_registry=resolved_registry,
+            auto_detect_tools=auto_detect_tools,
+        )
+        self.tool_registry = resolved_registry
         self.auto_detect_tools = auto_detect_tools
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="tool_augmented_rag",
+                description="Node instance name",
+            ),
+            "tool_registry": NodeParameter(
+                name="tool_registry",
+                type=dict,
+                required=False,
+                default=None,
+                description="Mapping of tool name to callable",
+            ),
+            "auto_detect_tools": NodeParameter(
+                name="auto_detect_tools",
+                type=bool,
+                required=False,
+                default=True,
+                description="Automatically detect which tools to invoke",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
@@ -653,7 +696,9 @@ class ToolAugmentedRAGNode(Node):
         """Detect which tools are needed for the query"""
         required = []
 
-        query_lower = query.lower()
+        # `query` is declared required, but a caller may still pass it as
+        # None explicitly; coerce so tool detection never crashes.
+        query_lower = (query or "").lower()
 
         # Simple keyword detection (would use NER/classification in production)
         if any(
@@ -679,7 +724,10 @@ class ToolAugmentedRAGNode(Node):
         if tool_outputs:
             answer_parts.append("and computational tools:")
             for tool, output in tool_outputs.items():
-                if "error" not in output:
+                # Registered tools are arbitrary user callables with no
+                # return-shape contract; only dict outputs carry an "error"
+                # key, so a non-dict return is treated as a successful result.
+                if not isinstance(output, dict) or "error" not in output:
                     answer_parts.append(f"\n- {tool}: {output}")
 
         answer_parts.append(
@@ -732,9 +780,9 @@ class ReasoningRAGNode(WorkflowNode):
     ):
         self.reasoning_depth = reasoning_depth
         self.strategy = strategy
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create reasoning RAG workflow"""
         builder = WorkflowBuilder()
 
@@ -761,7 +809,7 @@ Return JSON:
     "assumptions": ["list assumptions"],
     "complexity": "low|medium|high"
 }}""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -784,7 +832,7 @@ Provide:
 - What's needed next
 
 Be explicit about your logic.""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -802,7 +850,7 @@ Check:
 4. Are assumptions reasonable?
 
 Rate confidence: 0.0-1.0""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 

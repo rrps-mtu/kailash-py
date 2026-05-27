@@ -13,16 +13,24 @@ All implementations use existing Kailash components and WorkflowBuilder patterns
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 
+from kailash.nodes.base import Node, NodeParameter, register_node
 from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
 from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -79,16 +87,41 @@ class QueryExpansionNode(Node):
         expansion_method: str = "llm",
         num_expansions: int = 5,
     ):
+        super().__init__(
+            name=name,
+            expansion_method=expansion_method,
+            num_expansions=num_expansions,
+        )
         self.expansion_method = expansion_method
         self.num_expansions = num_expansions
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="query_expansion",
+                description="Node instance name",
+            ),
+            "expansion_method": NodeParameter(
+                name="expansion_method",
+                type=str,
+                required=False,
+                default="llm",
+                description="Algorithm (llm, wordnet, custom)",
+            ),
+            "num_expansions": NodeParameter(
+                name="num_expansions",
+                type=int,
+                required=False,
+                default=5,
+                description="Number of query variations to generate",
+            ),
             "query": NodeParameter(
                 name="query", type=str, required=True, description="Query to expand"
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -135,7 +168,7 @@ class QueryExpansionNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create query expansion workflow"""
         builder = WorkflowBuilder()
 
@@ -158,7 +191,7 @@ class QueryExpansionNode(Node):
                     "keywords": ["key1", "key2", ...],
                     "concepts": ["concept1", "concept2", ...]
                 }}""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -254,17 +287,24 @@ class QueryDecompositionNode(Node):
     """
 
     def __init__(self, name: str = "query_decomposition"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="query_decomposition",
+                description="Node instance name",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
                 required=True,
                 description="Complex query to decompose",
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -307,7 +347,7 @@ class QueryDecompositionNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create query decomposition workflow"""
         builder = WorkflowBuilder()
 
@@ -336,7 +376,7 @@ class QueryDecompositionNode(Node):
                     ],
                     "composition_strategy": "how to combine answers"
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -445,17 +485,24 @@ class QueryRewritingNode(Node):
     """
 
     def __init__(self, name: str = "query_rewriting"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="query_rewriting",
+                description="Node instance name",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
                 required=True,
                 description="Query to rewrite and improve",
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -522,7 +569,7 @@ class QueryRewritingNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create query rewriting workflow"""
         builder = WorkflowBuilder()
 
@@ -548,7 +595,7 @@ class QueryRewritingNode(Node):
                         "simplification": "simplified version"
                     }
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -576,7 +623,7 @@ class QueryRewritingNode(Node):
                     },
                     "recommended": "best version for retrieval"
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -676,17 +723,24 @@ class QueryIntentClassifierNode(Node):
     """
 
     def __init__(self, name: str = "query_intent_classifier"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="query_intent_classifier",
+                description="Node instance name",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
                 required=True,
                 description="Query to classify intent for",
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -790,7 +844,7 @@ class QueryIntentClassifierNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create intent classification workflow"""
         builder = WorkflowBuilder()
 
@@ -829,7 +883,7 @@ class QueryIntentClassifierNode(Node):
                     "requirements": ["req1", "req2", ...],
                     "suggested_strategy": "recommended RAG strategy"
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -942,17 +996,24 @@ class MultiHopQueryPlannerNode(Node):
     """
 
     def __init__(self, name: str = "multi_hop_planner"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="multi_hop_planner",
+                description="Node instance name",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
                 required=True,
                 description="Complex query requiring multi-hop planning",
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -1054,7 +1115,7 @@ class MultiHopQueryPlannerNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create multi-hop planning workflow"""
         builder = WorkflowBuilder()
 
@@ -1085,7 +1146,7 @@ class MultiHopQueryPlannerNode(Node):
                     "combination_strategy": "how to combine results",
                     "total_hops": number
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -1199,17 +1260,24 @@ class AdaptiveQueryProcessorNode(Node):
     """
 
     def __init__(self, name: str = "adaptive_query_processor"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         """Get node parameters"""
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="adaptive_query_processor",
+                description="Node instance name",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
                 required=True,
                 description="Query to process adaptively",
-            )
+            ),
         }
 
     def run(self, **kwargs) -> Dict[str, Any]:
@@ -1262,7 +1330,7 @@ class AdaptiveQueryProcessorNode(Node):
                 "error": str(e),
             }
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create adaptive query processing workflow"""
         builder = WorkflowBuilder()
 

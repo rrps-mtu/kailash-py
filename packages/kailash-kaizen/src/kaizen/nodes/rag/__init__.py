@@ -74,7 +74,7 @@ workflow.add_node("multi_vector", MultiVectorRetrievalNode())
 ### Performance Optimization
 - **CacheOptimizedRAGNode**: Multi-level caching with semantic similarity
 - **AsyncParallelRAGNode**: Concurrent strategy execution
-- **StreamingRAGNode**: Real-time progressive retrieval
+- **RealtimeStreamingRAGNode**: Real-time progressive retrieval
 - **BatchOptimizedRAGNode**: High-throughput batch processing
 
 ### Workflow Nodes
@@ -173,8 +173,7 @@ from .query_processing import (
 )
 
 # Real-time RAG
-from .realtime import IncrementalIndexNode, RealtimeRAGNode
-from .realtime import StreamingRAGNode as RealtimeStreamingRAGNode
+from .realtime import IncrementalIndexNode, RealtimeRAGNode, RealtimeStreamingRAGNode
 from .registry import RAGWorkflowRegistry
 from .router import (
     RAGPerformanceMonitorNode,
@@ -200,6 +199,7 @@ from .strategies import (
 from .workflows import (
     AdaptiveRAGWorkflowNode,
     AdvancedRAGWorkflowNode,
+    RAGPipelineWorkflowNode,
     SimpleRAGWorkflowNode,
 )
 
@@ -214,6 +214,7 @@ __all__ = [
     "SimpleRAGWorkflowNode",
     "AdvancedRAGWorkflowNode",
     "AdaptiveRAGWorkflowNode",
+    "RAGPipelineWorkflowNode",
     # Router & Analysis
     "RAGStrategyRouterNode",
     "RAGQualityAnalyzerNode",
