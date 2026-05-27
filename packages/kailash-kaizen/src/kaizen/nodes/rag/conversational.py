@@ -12,22 +12,31 @@ Implements RAG with conversation context and memory management:
 Based on conversational AI and dialogue systems research.
 """
 
-import hashlib
 import json
 import logging
+import os
+import secrets
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Deque, Dict, List, Optional, Union
 
-# from ..data.cache import CacheNode  # TODO: Implement CacheNode
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.code.python import PythonCodeNode
+from kailash.nodes.logic.workflow import WorkflowNode
 from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
 from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -110,11 +119,17 @@ class ConversationalRAGNode(WorkflowNode):
         self.topic_tracking = topic_tracking
         # In-memory session storage (use persistent storage in production)
         self.sessions = {}
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create conversational RAG workflow"""
         builder = WorkflowBuilder()
+
+        # Bound only inside the optional-branches below; initialize at entry
+        # so the wiring loop never sees an unbound name on a False branch.
+        coreference_resolver_id: Optional[str] = None
+        topic_tracker_id: Optional[str] = None
+        summarizer_id: Optional[str] = None
 
         # Session context loader
         context_loader_id = builder.add_node(
@@ -196,7 +211,7 @@ Return JSON:
 }
 
 If no coreferences found, return the original query.""",
-                    "model": "gpt-4",
+                    "model": _DEFAULT_LLM_MODEL,
                 },
             )
 
@@ -383,7 +398,7 @@ For continuations, reference previous context:
 {"Personalize based on user preferences when available." if self.personalization_enabled else ""}
 
 Keep responses conversational and engaging.""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -404,7 +419,7 @@ Focus on:
 
 Keep the summary under 100 words.
 This will be used to maintain context in future turns.""",
-                    "model": "gpt-4",
+                    "model": _DEFAULT_LLM_MODEL,
                 },
             )
 
@@ -533,6 +548,9 @@ result = {
         )
 
         if self.coreference_resolution:
+            assert (
+                coreference_resolver_id is not None
+            )  # narrowed: bound in optional block above
             builder.add_connection(
                 context_loader_id, "session_context", coreference_resolver_id, "context"
             )
@@ -541,6 +559,9 @@ result = {
             )
 
         if self.topic_tracking:
+            assert (
+                topic_tracker_id is not None
+            )  # narrowed: bound in optional block above
             builder.add_connection(
                 context_loader_id,
                 "session_context",
@@ -565,6 +586,7 @@ result = {
         )
 
         if self.enable_summarization:
+            assert summarizer_id is not None  # narrowed: bound in optional block above
             builder.add_connection(
                 context_loader_id,
                 "session_context",
@@ -579,6 +601,9 @@ result = {
             response_generator_id, "response", session_updater_id, "response"
         )
         if self.topic_tracking:
+            assert (
+                topic_tracker_id is not None
+            )  # narrowed: bound in optional block above
             builder.add_connection(
                 topic_tracker_id, "topic_analysis", session_updater_id, "topic_info"
             )
@@ -590,6 +615,9 @@ result = {
             response_generator_id, "response", result_formatter_id, "response"
         )
         if self.topic_tracking:
+            assert (
+                topic_tracker_id is not None
+            )  # narrowed: bound in optional block above
             builder.add_connection(
                 topic_tracker_id, "topic_analysis", result_formatter_id, "topic_info"
             )
@@ -602,11 +630,14 @@ result = {
 
         return builder.build(name="conversational_rag_workflow")
 
-    def create_session(self, user_id: str = None) -> Dict[str, Any]:
+    def create_session(self, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Create a new conversation session"""
-        session_id = hashlib.sha256(
-            f"{user_id or 'anonymous'}_{datetime.now().isoformat()}".encode()
-        ).hexdigest()[:16]
+        # F9 #1116: session_id MUST come from a cryptographically-strong
+        # source — the prior `sha256(f"{user_or_anon}_{datetime}")[:16]`
+        # form admitted ~10⁶ brute-force ops within a 1-second window on
+        # the anonymous flow because the input space was enumerable.
+        # `secrets.token_hex(16)` emits 32 hex chars of CSPRNG output.
+        session_id = secrets.token_hex(16)
 
         session = {
             "id": session_id,
@@ -681,25 +712,66 @@ class ConversationMemoryNode(Node):
     def __init__(
         self,
         name: str = "conversation_memory",
-        memory_types: List[str] = None,
+        memory_types: Optional[List[str]] = None,
         retention_policy: str = "adaptive",
         max_memories_per_user: int = 1000,
     ):
-        self.memory_types = memory_types or ["episodic", "semantic", "preferences"]
+        resolved_memory_types = memory_types or [
+            "episodic",
+            "semantic",
+            "preferences",
+        ]
+        super().__init__(
+            name=name,
+            memory_types=resolved_memory_types,
+            retention_policy=retention_policy,
+            max_memories_per_user=max_memories_per_user,
+        )
+        self.memory_types = resolved_memory_types
         self.retention_policy = retention_policy
         self.max_memories_per_user = max_memories_per_user
-        # In-memory storage (use persistent DB in production)
-        self.memory_store = defaultdict(
+        # In-memory storage (use persistent DB in production). The per-user
+        # value is a dict with mixed-typed slots (`episodic` → deque,
+        # `semantic` / `preferences` → dict); typed Any because each key
+        # carries a distinct narrowed shape used at access sites.
+        self.memory_store: Dict[str, Dict[str, Any]] = defaultdict(
             lambda: {
                 "episodic": deque(maxlen=max_memories_per_user),
                 "semantic": {},
                 "preferences": {},
             }
         )
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="conversation_memory",
+                description="Node instance name",
+            ),
+            "memory_types": NodeParameter(
+                name="memory_types",
+                type=list,
+                required=False,
+                default=None,
+                description="Memory categories (episodic, semantic, preferences)",
+            ),
+            "retention_policy": NodeParameter(
+                name="retention_policy",
+                type=str,
+                required=False,
+                default="adaptive",
+                description="Memory retention strategy",
+            ),
+            "max_memories_per_user": NodeParameter(
+                name="max_memories_per_user",
+                type=int,
+                required=False,
+                default=1000,
+                description="Per-user episodic memory cap",
+            ),
             "operation": NodeParameter(
                 name="operation",
                 type=str,
@@ -862,9 +934,9 @@ class ConversationMemoryNode(Node):
                 key = fact_update.get("key")
                 if key in user_memory["semantic"]:
                     user_memory["semantic"][key].update(fact_update.get("updates", {}))
-                    user_memory["semantic"][key]["timestamp"] = (
-                        datetime.now().isoformat()
-                    )
+                    user_memory["semantic"][key][
+                        "timestamp"
+                    ] = datetime.now().isoformat()
                     updated["semantic"] += 1
 
         # Update preferences

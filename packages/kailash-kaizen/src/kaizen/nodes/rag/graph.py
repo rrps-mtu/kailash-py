@@ -10,20 +10,30 @@ Implements knowledge graph-based retrieval for complex reasoning:
 Based on Microsoft GraphRAG (2024) and knowledge graph research.
 """
 
-import json
 import logging
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+import os
+from typing import Any, Dict, List, Optional
 
 import networkx as nx
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.code.python import (  # noqa: F401  registers "PythonCodeNode"
+    PythonCodeNode,
+)
+from kailash.nodes.logic.workflow import WorkflowNode
 from kailash.workflow.builder import WorkflowBuilder
+from kailash.workflow.graph import Workflow
 
-from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
+from ..ai.llm_agent import LLMAgentNode  # noqa: F401  registers "LLMAgentNode"
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -82,8 +92,8 @@ class GraphRAGNode(WorkflowNode):
     def __init__(
         self,
         name: str = "graph_rag",
-        entity_types: List[str] = None,
-        relationship_types: List[str] = None,
+        entity_types: Optional[List[str]] = None,
+        relationship_types: Optional[List[str]] = None,
         max_hops: int = 2,
         community_algorithm: str = "louvain",
         use_global_summary: bool = True,
@@ -103,11 +113,14 @@ class GraphRAGNode(WorkflowNode):
         self.max_hops = max_hops
         self.community_algorithm = community_algorithm
         self.use_global_summary = use_global_summary
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create knowledge graph RAG workflow"""
         builder = WorkflowBuilder()
+        # Bound before the conditional so the use site below is provably bound
+        # whether or not the optional summary node is added.
+        summary_generator_id: Optional[str] = None
 
         # Entity extraction
         entity_extractor_id = builder.add_node(
@@ -128,7 +141,7 @@ class GraphRAGNode(WorkflowNode):
                         {{"source": "...", "target": "...", "type": "...", "description": "..."}}
                     ]
                 }}""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -227,7 +240,7 @@ result = {{"graph_data": build_knowledge_graph(extraction_results)}}
                     "requires_multi_hop": true/false,
                     "reasoning_type": "causal/comparative/analytical"
                 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -347,7 +360,7 @@ result = {{"graph_retrieval": retrieval_result}}
                     "system_prompt": """Generate high-level summaries of document communities.
                     Focus on main themes, key entities, and important relationships.
                     Be concise but comprehensive.""",
-                    "model": "gpt-4",
+                    "model": _DEFAULT_LLM_MODEL,
                 },
             )
 
@@ -438,6 +451,9 @@ result = {
         )
 
         if self.use_global_summary:
+            # The same guard bound summary_generator_id above; assert pins the
+            # invariant for the type checker.
+            assert summary_generator_id is not None
             builder.add_connection(
                 graph_builder_id, "graph_data", summary_generator_id, "graph_data"
             )
@@ -499,14 +515,55 @@ class GraphBuilderNode(Node):
         track_temporal: bool = False,
         confidence_scoring: bool = True,
     ):
+        super().__init__(
+            name=name,
+            merge_similar_entities=merge_similar_entities,
+            similarity_threshold=similarity_threshold,
+            track_temporal=track_temporal,
+            confidence_scoring=confidence_scoring,
+        )
         self.merge_similar_entities = merge_similar_entities
         self.similarity_threshold = similarity_threshold
         self.track_temporal = track_temporal
         self.confidence_scoring = confidence_scoring
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="graph_builder",
+                description="Node instance name",
+            ),
+            "merge_similar_entities": NodeParameter(
+                name="merge_similar_entities",
+                type=bool,
+                required=False,
+                default=True,
+                description="Merge entities above the similarity threshold",
+            ),
+            "similarity_threshold": NodeParameter(
+                name="similarity_threshold",
+                type=float,
+                required=False,
+                default=0.85,
+                description="Entity-merge similarity threshold",
+            ),
+            "track_temporal": NodeParameter(
+                name="track_temporal",
+                type=bool,
+                required=False,
+                default=False,
+                description="Track temporal relationships between entities",
+            ),
+            "confidence_scoring": NodeParameter(
+                name="confidence_scoring",
+                type=bool,
+                required=False,
+                default=True,
+                description="Attach confidence scores to extracted edges",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -546,14 +603,19 @@ class GraphBuilderNode(Node):
 
         # Add sample graph building logic
         for doc in documents:
-            doc_id = doc.get("id", hash(doc.get("content", "")))
+            # Skip malformed (non-dict) entries rather than crashing on
+            # ``str.get`` — a document list may carry malformed elements.
+            if not isinstance(doc, dict):
+                continue
 
-            # Simplified entity extraction
-            # In production, would use proper NER
-            words = doc.get("content", "").split()
+            # ``doc.get("content", "")`` only defaults a MISSING key — a key
+            # present with value ``None`` returns ``None``. Coerce with
+            # ``or ""`` so the scoring path never calls a str method on None.
+            content = doc.get("content") or ""
+            doc_id = doc.get("id", hash(content))
 
             # Add some sample entities
-            if "transformer" in doc.get("content", "").lower():
+            if "transformer" in content.lower():
                 G.add_node("transformer", type="technology", documents={doc_id})
                 G.add_node("attention", type="concept", documents={doc_id})
                 G.add_edge("transformer", "attention", type="uses", confidence=0.9)
@@ -621,10 +683,17 @@ class GraphQueryNode(Node):
     """
 
     def __init__(self, name: str = "graph_query"):
-        super().__init__(name)
+        super().__init__(name=name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="graph_query",
+                description="Node instance name",
+            ),
             "graph": NodeParameter(
                 name="graph",
                 type=dict,
@@ -709,8 +778,14 @@ class GraphQueryNode(Node):
                 "avg_degree": (
                     sum(dict(G.degree()).values()) / len(G) if len(G) > 0 else 0
                 ),
+                # ``nx.average_clustering`` is undefined on a multigraph.
+                # ``GraphBuilderNode`` produces a ``MultiDiGraph`` whose
+                # node-link round-trip is also a multigraph, so collapse to a
+                # simple undirected ``Graph`` before computing clustering.
                 "clustering_coefficient": (
-                    nx.average_clustering(G.to_undirected()) if len(G) > 0 else 0
+                    nx.average_clustering(nx.Graph(G.to_undirected()))
+                    if len(G) > 0
+                    else 0
                 ),
             }
 

@@ -13,12 +13,13 @@ Domain truth for the Kailash platform. Each file is authoritative for its domain
 
 ## DataFlow
 
-| File                                       | Description                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------------ |
-| [dataflow-core.md](dataflow-core.md)       | DataFlow class, constructor, configuration, connection URL, engine, exceptions |
-| [dataflow-express.md](dataflow-express.md) | Express API (create/read/update/delete/list/count/bulk), Express Sync          |
-| [dataflow-models.md](dataflow-models.md)   | @db.model, field types, validation, classification, multi-tenant               |
-| [dataflow-cache.md](dataflow-cache.md)     | Cache layer, dialect, record ID coercion, transactions, pooling                |
+| File                                             | Description                                                                                                                                            |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [dataflow-core.md](dataflow-core.md)             | DataFlow class, constructor, configuration, connection URL, engine, exceptions                                                                         |
+| [dataflow-express.md](dataflow-express.md)       | Express API (create/read/update/delete/list/count/bulk), Express Sync                                                                                  |
+| [dataflow-models.md](dataflow-models.md)         | @db.model, field types, validation, classification, multi-tenant                                                                                       |
+| [dataflow-cache.md](dataflow-cache.md)           | Cache layer, dialect, record ID coercion, transactions, pooling                                                                                        |
+| [dataflow-protection.md](dataflow-protection.md) | ProtectedDataFlow write-protection invariants I1-I9, OperationType enum, check_operation routing, async-hot-path wiring (#1050/#1058 closure baseline) |
 
 ## Nexus
 
@@ -43,6 +44,7 @@ Domain truth for the Kailash platform. Each file is authoritative for its domain
 | [kaizen-evaluation.md](kaizen-evaluation.md)             | **Algorithmic NLP metrics** (ROUGE / BLEU / BERTScore, split from `kaizen.judges` per SYNTHESIS PR#5): pure-math reference comparison, no LLM / cost / budget surface, `[evaluation]` extra                                                                                                                          |
 | [kaizen-observability.md](kaizen-observability.md)       | **AgentDiagnostics + TraceExporter** (cross-SDK Diagnostic + TraceEvent Protocols, PR#6 of #567): context-managed agent-run diagnostics, single-filter-point sink adapter with N4 canonical fingerprint parity (kailash-rs#468 / v3.17.1+), BaseAgent hot-path wiring, no Langfuse coupling                          |
 | [kaizen-tools.md](kaizen-tools.md)                       | **BaseTool family contract** (#814): `async def execute(self, **kwargs) -> NativeToolResult` LSP-permissive base + 19-subclass override pattern (`*, <named>, **_kwargs: Any`), `ToolRegistry` dispatcher, `BaseTool.get_schema()` LLM-facing surface, error contract, `[research]` + `[web-search]` optional extras |
+| [kaizen-rag.md](kaizen-rag.md)                           | RAG node toolkit — similarity/retrieval nodes (F8 coverage, incremental)                                                                                                                                                                                                                                             |
 
 ## Kaizen Agents (Layer 2 Patterns)
 

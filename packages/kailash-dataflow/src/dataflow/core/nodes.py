@@ -440,7 +440,10 @@ class NodeGenerator:
 
         # Register nodes with Kailash's NodeRegistry system
         for node_name, node_class in nodes.items():
-            NodeRegistry.register(node_class, alias=node_name)
+            # allow_override: @db.model regenerates CRUD node classes per
+            # decoration; their names may coincide with static nodes — the
+            # overwrite is intentional, exempt from the issue-#891 guard.
+            NodeRegistry.register(node_class, alias=node_name, allow_override=True)
             # Also register in module namespace for direct imports
             globals()[node_name] = node_class
             # Store in DataFlow instance for testing
@@ -478,7 +481,10 @@ class NodeGenerator:
 
         # Register nodes with Kailash's NodeRegistry system
         for node_name, node_class in nodes.items():
-            NodeRegistry.register(node_class, alias=node_name)
+            # allow_override: @db.model regenerates CRUD node classes per
+            # decoration; their names may coincide with static nodes — the
+            # overwrite is intentional, exempt from the issue-#891 guard.
+            NodeRegistry.register(node_class, alias=node_name, allow_override=True)
             globals()[node_name] = node_class
             # Store in DataFlow instance for testing
             self.dataflow_instance._nodes[node_name] = node_class
@@ -802,7 +808,25 @@ class NodeGenerator:
                         from datetime import date, datetime, time
                         from decimal import Decimal
 
-                        # Safe types that don't need sanitization (including dict/list)
+                        # Safe types that don't need sanitization (including
+                        # dict/list/set/tuple). These are returned UNCHANGED
+                        # so the downstream type-confusion gate (see the
+                        # ``isinstance(value, (dict, list, set, tuple))`` check
+                        # in the create/update + bulk_ branches of
+                        # validate_inputs below) sees the real container type
+                        # and raises ``ValueError("parameter type mismatch")``
+                        # for a declared-``str`` field. ``set``/``tuple`` MUST
+                        # be in this tuple: without them they fall through to
+                        # ``value = str(value)`` BEFORE the gate runs, the gate
+                        # then sees a ``str`` (isinstance False) and the
+                        # confusion bypass goes undetected — the exact
+                        # rules/security.md § Sanitizer Contract Rule 2
+                        # violation issue #1047 closes. The gate (not this
+                        # passthrough) is what enforces the raise; this list is
+                        # "don't pre-coerce away the type the gate needs".
+                        # Declared-dict / declared-list JSON / array columns
+                        # (bug #515) also rely on dict/list passing through
+                        # unchanged here — do NOT remove any entry.
                         safe_types = (
                             int,
                             float,
@@ -813,6 +837,8 @@ class NodeGenerator:
                             Decimal,
                             dict,
                             list,
+                            set,
+                            tuple,
                         )
                         if isinstance(value, safe_types):
                             return (

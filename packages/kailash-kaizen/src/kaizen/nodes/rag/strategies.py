@@ -7,13 +7,20 @@ a workflow using WorkflowBuilder and delegates all execution to the SDK.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.logic.workflow import WorkflowNode
+
+# Registering import: kailash uses a lazy module cache, so the
+# `@register_node()` decorators on SemanticChunkerNode / StatisticalChunkerNode /
+# HierarchicalChunkerNode fire only when `kailash.nodes.transform.chunkers` is
+# actually imported. The `create_*_rag_workflow` builders below reference those
+# node types by string in `add_node(...)`; importing the module here ensures the
+# registry is populated before any `_create_workflow()` runs.
+from kailash.nodes.transform import chunkers as _chunkers  # noqa: F401
 from kailash.workflow.builder import WorkflowBuilder
-
-from ..base import Node, NodeParameter, register_node
-from ..logic.workflow import WorkflowNode
 
 logger = logging.getLogger(__name__)
 
@@ -127,12 +134,13 @@ def create_statistical_rag_workflow(config: RAGConfig) -> WorkflowNode:
             "code": """
 import re
 def extract_keywords(text):
-    words = re.findall(r'\\b[a-zA-Z]{3,}\\b', text.lower())
+    # A present-but-None `content` key would otherwise crash text.lower().
+    words = re.findall(r'\\b[a-zA-Z]{3,}\\b', (text or "").lower())
     stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'man', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'its', 'let', 'put', 'say', 'she', 'too', 'use'}
     keywords = [word for word in set(words) if word not in stop_words]
     return keywords[:20]
 
-result = {"keywords": [extract_keywords(chunk["content"]) for chunk in chunks]}
+result = {"keywords": [extract_keywords(chunk.get("content")) for chunk in (chunks or []) if isinstance(chunk, dict)]}
 """
         },
     )
@@ -187,17 +195,21 @@ def create_hybrid_rag_workflow(
     semantic_workflow = create_semantic_rag_workflow(config)
     statistical_workflow = create_statistical_rag_workflow(config)
 
-    # Add sub-workflows as nodes
+    # Add sub-workflows as nodes.
+    # `# type: ignore[attr-defined]` on each `.workflow` access below:
+    # @register_node erases the concrete WorkflowNode type to base Node, so a
+    # static checker does not see `.workflow` — but it IS a real read-only
+    # WorkflowNode property (added by shard A3) and resolves at runtime.
     semantic_id = builder.add_node(
         "WorkflowNode",
         node_id="semantic_rag",
-        config={"workflow": semantic_workflow.workflow},
+        config={"workflow": semantic_workflow.workflow},  # type: ignore[attr-defined]
     )
 
     statistical_id = builder.add_node(
         "WorkflowNode",
         node_id="statistical_rag",
-        config={"workflow": statistical_workflow.workflow},
+        config={"workflow": statistical_workflow.workflow},  # type: ignore[attr-defined]
     )
 
     # Add result fusion node
@@ -291,9 +303,10 @@ def create_hierarchical_rag_workflow(config: RAGConfig) -> WorkflowNode:
             "code": """
 levels = ["document", "section", "paragraph"]
 level_chunks = {}
+_chunks = [c for c in (chunks or []) if isinstance(c, dict)]
 
 for level in levels:
-    level_chunks[level] = [chunk for chunk in chunks if chunk.get("hierarchy_level") == level]
+    level_chunks[level] = [chunk for chunk in _chunks if chunk.get("hierarchy_level") == level]
 
 result = {"level_chunks": level_chunks, "levels": levels}
 """
@@ -381,12 +394,28 @@ class SemanticRAGNode(Node):
     """
 
     def __init__(self, name: str = "semantic_rag", config: Optional[RAGConfig] = None):
-        self.config = config or RAGConfig()
+        super().__init__(name=name)
+        # Node-specific RAG configuration: stored under `rag_config`, NOT
+        # `self.config` — the base Node reserves `self.config` for its dict
+        # config-bag, and the __init_with_capture wrapper iterates it.
+        self.rag_config = config or RAGConfig()
         self.workflow_node = None
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="semantic_rag",
+                description="Node instance name",
+            ),
+            "config": NodeParameter(
+                name="config",
+                type=dict,
+                required=False,
+                description="RAG configuration parameters",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -410,7 +439,7 @@ class SemanticRAGNode(Node):
     def run(self, **kwargs) -> Dict[str, Any]:
         """Run semantic RAG using WorkflowNode"""
         if not self.workflow_node:
-            self.workflow_node = create_semantic_rag_workflow(self.config)
+            self.workflow_node = create_semantic_rag_workflow(self.rag_config)
 
         # Delegate to WorkflowNode
         return self.workflow_node.execute(**kwargs)
@@ -428,12 +457,26 @@ class StatisticalRAGNode(Node):
     def __init__(
         self, name: str = "statistical_rag", config: Optional[RAGConfig] = None
     ):
-        self.config = config or RAGConfig()
+        super().__init__(name=name)
+        # Node-specific RAG configuration under `rag_config` (see SemanticRAGNode).
+        self.rag_config = config or RAGConfig()
         self.workflow_node = None
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="statistical_rag",
+                description="Node instance name",
+            ),
+            "config": NodeParameter(
+                name="config",
+                type=dict,
+                required=False,
+                description="RAG configuration parameters",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -457,7 +500,7 @@ class StatisticalRAGNode(Node):
     def run(self, **kwargs) -> Dict[str, Any]:
         """Run statistical RAG using WorkflowNode"""
         if not self.workflow_node:
-            self.workflow_node = create_statistical_rag_workflow(self.config)
+            self.workflow_node = create_statistical_rag_workflow(self.rag_config)
 
         return self.workflow_node.execute(**kwargs)
 
@@ -477,13 +520,27 @@ class HybridRAGNode(Node):
         config: Optional[RAGConfig] = None,
         fusion_method: str = "rrf",
     ):
-        self.config = config or RAGConfig()
+        super().__init__(name=name, fusion_method=fusion_method)
+        # Node-specific RAG configuration under `rag_config` (see SemanticRAGNode).
+        self.rag_config = config or RAGConfig()
         self.fusion_method = fusion_method
         self.workflow_node = None
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="hybrid_rag",
+                description="Node instance name",
+            ),
+            "config": NodeParameter(
+                name="config",
+                type=dict,
+                required=False,
+                description="RAG configuration parameters",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -516,7 +573,9 @@ class HybridRAGNode(Node):
 
         if not self.workflow_node or fusion_method != self.fusion_method:
             self.fusion_method = fusion_method
-            self.workflow_node = create_hybrid_rag_workflow(self.config, fusion_method)
+            self.workflow_node = create_hybrid_rag_workflow(
+                self.rag_config, fusion_method
+            )
 
         return self.workflow_node.execute(**kwargs)
 
@@ -533,12 +592,26 @@ class HierarchicalRAGNode(Node):
     def __init__(
         self, name: str = "hierarchical_rag", config: Optional[RAGConfig] = None
     ):
-        self.config = config or RAGConfig()
+        super().__init__(name=name)
+        # Node-specific RAG configuration under `rag_config` (see SemanticRAGNode).
+        self.rag_config = config or RAGConfig()
         self.workflow_node = None
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="hierarchical_rag",
+                description="Node instance name",
+            ),
+            "config": NodeParameter(
+                name="config",
+                type=dict,
+                required=False,
+                description="RAG configuration parameters",
+            ),
             "documents": NodeParameter(
                 name="documents",
                 type=list,
@@ -562,6 +635,6 @@ class HierarchicalRAGNode(Node):
     def run(self, **kwargs) -> Dict[str, Any]:
         """Run hierarchical RAG using WorkflowNode"""
         if not self.workflow_node:
-            self.workflow_node = create_hierarchical_rag_workflow(self.config)
+            self.workflow_node = create_hierarchical_rag_workflow(self.rag_config)
 
         return self.workflow_node.execute(**kwargs)

@@ -11,22 +11,32 @@ Implements RAG with support for multiple modalities:
 Based on CLIP, BLIP-2, and multimodal research from 2024.
 """
 
-import base64
-import json
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+import os
+from typing import Any, Dict, Union
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+
+# PythonCodeNode and LLMAgentNode are imported for their @register_node
+# decorator side-effect: the codegen workflow below references them by the
+# string node-type name ("PythonCodeNode" / "LLMAgentNode"), which the runtime
+# resolves through the node registry. The imports populate that registry.
+from kailash.nodes.code.python import PythonCodeNode  # noqa: F401
+from kailash.nodes.logic.workflow import WorkflowNode
+from kailash.workflow import Workflow
 from kailash.workflow.builder import WorkflowBuilder
 
-from ..ai.llm_agent import LLMAgentNode
-from ..base import Node, NodeParameter, register_node
-
-# from ..data.readers import ImageReaderNode  # TODO: Implement ImageReaderNode
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
+from ..ai.llm_agent import LLMAgentNode  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+# F9 #1126: env-loaded default LLM model. Mirrors the router.py precedent
+# (F8 B10). May be None when neither env var is set — that is
+# env-models-compliant; do NOT fall back to a hardcoded model name.
+_DEFAULT_LLM_MODEL = os.environ.get(
+    "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+)
 
 
 @register_node()
@@ -91,9 +101,9 @@ class MultimodalRAGNode(WorkflowNode):
         self.image_encoder = image_encoder
         self.enable_ocr = enable_ocr
         self.fusion_strategy = fusion_strategy
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create multimodal RAG workflow"""
         builder = WorkflowBuilder()
 
@@ -117,7 +127,7 @@ Return JSON:
     "image_weight": 0.0-1.0,
     "query_type": "visual|textual|mixed"
 }""",
-                "model": "gpt-4",
+                "model": _DEFAULT_LLM_MODEL,
             },
         )
 
@@ -137,12 +147,16 @@ def preprocess_documents(documents):
     image_docs = []
 
     for doc in documents:
+        # Documents are arbitrary user input; skip non-dict elements rather
+        # than crash on `.get`.
+        if not isinstance(doc, dict):
+            continue
         doc_type = doc.get("type", "text")
 
         if doc_type == "text":
             text_docs.append({{
                 "id": doc.get("id", f"text_{{len(text_docs)}}"),
-                "content": doc.get("content", ""),
+                "content": doc.get("content") or "",
                 "title": doc.get("title", ""),
                 "metadata": doc.get("metadata", {{}})
             }})
@@ -157,7 +171,7 @@ def preprocess_documents(documents):
                 "caption": doc.get("caption", ""),
                 "alt_text": doc.get("alt_text", ""),
                 "metadata": doc.get("metadata", {{}}),
-                "associated_text": doc.get("content", "")
+                "associated_text": doc.get("content") or ""
             }}
 
             # If OCR is enabled, we'd extract text here
@@ -171,7 +185,7 @@ def preprocess_documents(documents):
             if doc.get("content"):
                 text_docs.append({{
                     "id": f"{{doc.get('id', '')}}_text",
-                    "content": doc.get("content", ""),
+                    "content": doc.get("content") or "",
                     "title": doc.get("title", ""),
                     "metadata": {{"from_multimodal": True}}
                 }})
@@ -183,7 +197,7 @@ def preprocess_documents(documents):
             "stats": {{
                 "total_text": len(text_docs),
                 "total_images": len(image_docs),
-                "multimodal_docs": len([d for d in documents if d.get("type") == "multimodal"])
+                "multimodal_docs": len([d for d in documents if isinstance(d, dict) and d.get("type") == "multimodal"])
             }}
         }}
     }}
@@ -205,10 +219,15 @@ def encode_multimodal(text_docs, image_docs, query, modality_analysis):
 
     # Simulated encoding (would use CLIP/BLIP in production)
     def text_encoder(text):
+        # Documents are arbitrary user input; a present-but-None content/title
+        # would crash `text[:10]`. Coerce non-strings to "" at the boundary.
+        text = text if isinstance(text, str) else ""
         # Simple hash-based encoding for demo
         return [float(ord(c)) / 100 for c in text[:10]]
 
     def image_encoder(image_path):
+        # A present-but-None image path would crash `.lower()`. Coerce here.
+        image_path = image_path if isinstance(image_path, str) else ""
         # Simulated image encoding
         if "architecture" in image_path.lower():
             return [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
@@ -223,7 +242,8 @@ def encode_multimodal(text_docs, image_docs, query, modality_analysis):
     # Encode text documents
     text_embeddings = []
     for doc in text_docs:
-        content = doc.get("content", "") + " " + doc.get("title", "")
+        # `or ""` coerces a present-but-None content/title before the `+`.
+        content = (doc.get("content") or "") + " " + (doc.get("title") or "")
         text_embeddings.append({{
             "id": doc["id"],
             "embedding": text_encoder(content),
@@ -237,7 +257,8 @@ def encode_multimodal(text_docs, image_docs, query, modality_analysis):
         visual_emb = image_encoder(doc.get("path", ""))
 
         # If we have caption or OCR text, encode that too
-        text_content = doc.get("caption", "") + " " + doc.get("ocr_text", "")
+        # `or ""` coerces a present-but-None caption/ocr_text before the `+`.
+        text_content = (doc.get("caption") or "") + " " + (doc.get("ocr_text") or "")
         if text_content.strip():
             text_emb = text_encoder(text_content)
             # Fusion of visual and textual
@@ -307,8 +328,10 @@ def retrieve_multimodal(encoded_data, modality_analysis):
     for doc in image_embs:
         score = compute_similarity(query_emb, doc["embedding"])
 
-        # Boost score if query mentions visual terms
-        query_lower = query.lower()
+        # Boost score if query mentions visual terms.
+        # `query` is a workflow input; coerce a None/non-str value before
+        # `.lower()` so the retriever degrades instead of crashing.
+        query_lower = (query if isinstance(query, str) else "").lower()
         if any(term in query_lower for term in ["diagram", "image", "show", "picture", "visual"]):
             score *= 1.5
 
@@ -470,12 +493,37 @@ class VisualQuestionAnsweringNode(Node):
         model: str = "blip2-base",
         enable_captioning: bool = True,
     ):
+        super().__init__(
+            name=name,
+            model=model,
+            enable_captioning=enable_captioning,
+        )
         self.model = model
         self.enable_captioning = enable_captioning
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="vqa_node",
+                description="Node instance name",
+            ),
+            "model": NodeParameter(
+                name="model",
+                type=str,
+                required=False,
+                default="blip2-base",
+                description="Vision-language model for VQA",
+            ),
+            "enable_captioning": NodeParameter(
+                name="enable_captioning",
+                type=bool,
+                required=False,
+                default=True,
+                description="Generate an image caption alongside the answer",
+            ),
             "image_path": NodeParameter(
                 name="image_path",
                 type=str,
@@ -498,8 +546,11 @@ class VisualQuestionAnsweringNode(Node):
 
     def run(self, **kwargs) -> Dict[str, Any]:
         """Answer questions about images"""
-        image_path = kwargs.get("image_path", "")
-        question = kwargs.get("question", "")
+        # `kwargs.get(..., "")` defaults only apply when the key is MISSING;
+        # an explicit `question=None` returns None and `.lower()` would crash.
+        # `(value or "")` coerces a present-but-None value to an empty string.
+        image_path = kwargs.get("image_path") or ""
+        question = kwargs.get("question") or ""
 
         # Simulated VQA (would use real model in production)
         # Analyze question type
@@ -551,6 +602,12 @@ class VisualQuestionAnsweringNode(Node):
             "image_caption": caption,
             "detected_objects": detected_objects,
             "model_used": self.model,
+            # Echo the documented `image_path` input so the result truthfully
+            # reports which image the node was asked about. `image_path` is a
+            # required parameter (get_parameters); the simulated VQA scores
+            # `question` only and cannot read pixels — but it MUST NOT silently
+            # drop a documented input (zero-tolerance Rule 3c).
+            "image_path": image_path,
         }
 
 
@@ -592,12 +649,37 @@ class ImageTextMatchingNode(Node):
         matching_model: str = "clip",
         bidirectional: bool = True,
     ):
+        super().__init__(
+            name=name,
+            matching_model=matching_model,
+            bidirectional=bidirectional,
+        )
         self.matching_model = matching_model
         self.bidirectional = bidirectional
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="image_text_matcher",
+                description="Node instance name",
+            ),
+            "matching_model": NodeParameter(
+                name="matching_model",
+                type=str,
+                required=False,
+                default="clip",
+                description="Image-text matching model",
+            ),
+            "bidirectional": NodeParameter(
+                name="bidirectional",
+                type=bool,
+                required=False,
+                default=True,
+                description="Match in both image->text and text->image directions",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=Union[str, dict],
@@ -622,7 +704,7 @@ class ImageTextMatchingNode(Node):
     def run(self, **kwargs) -> Dict[str, Any]:
         """Find matching images or text"""
         query = kwargs.get("query")
-        collection = kwargs.get("collection", [])
+        collection = kwargs.get("collection") or []
         top_k = kwargs.get("top_k", 5)
 
         # Determine match type
@@ -631,19 +713,28 @@ class ImageTextMatchingNode(Node):
         else:
             match_type = "image_to_text"
 
+        # `query_lower` is only consulted on the text_to_image path, where
+        # `query` is guaranteed a str; the empty default keeps the type
+        # checker satisfied on the image_to_text path.
+        query_lower = query.lower() if isinstance(query, str) else ""
+
         # Perform matching (simplified)
         matches = []
 
         for i, item in enumerate(collection[:20]):  # Limit for demo
+            # Collection elements are arbitrary user input; a non-dict element
+            # has no `.get` and would crash. Skip it rather than crash the node.
+            if not isinstance(item, dict):
+                continue
             # Calculate similarity
             if match_type == "text_to_image":
                 # Text query to image matching
-                if "architecture" in query.lower() and "diagram" in str(
+                if "architecture" in query_lower and "diagram" in str(
                     item.get("tags", [])
                 ):
                     score = 0.9
                 elif any(
-                    word in query.lower()
+                    word in query_lower
                     for word in str(item.get("caption", "")).lower().split()
                 ):
                     score = 0.7

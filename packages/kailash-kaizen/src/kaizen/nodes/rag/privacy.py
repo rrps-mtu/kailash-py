@@ -20,12 +20,12 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Union
 
+from kailash.nodes.base import Node, NodeParameter, register_node
+from kailash.nodes.code.python import PythonCodeNode
+from kailash.nodes.logic.workflow import WorkflowNode
+from kailash.nodes.security.credential_manager import CredentialManagerNode
 from kailash.workflow.builder import WorkflowBuilder
-
-from ..base import Node, NodeParameter, register_node
-from ..code.python import PythonCodeNode
-from ..logic.workflow import WorkflowNode
-from ..security.credential_manager import CredentialManagerNode
+from kailash.workflow.graph import Workflow
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +94,15 @@ class PrivacyPreservingRAGNode(WorkflowNode):
         self.redact_pii = redact_pii
         self.anonymize_queries = anonymize_queries
         self.audit_logging = audit_logging
-        super().__init__(name, self._create_workflow())
+        super().__init__(workflow=self._create_workflow(), name=name)
 
-    def _create_workflow(self) -> WorkflowNode:
+    def _create_workflow(self) -> Workflow:
         """Create privacy-preserving RAG workflow"""
         builder = WorkflowBuilder()
+        # The audit_logger node is wired only when self.audit_logging is True;
+        # initialize the id to None so the closure-parity wiring branch below
+        # is statically reachable even when audit_logging is False.
+        audit_logger_id: Optional[str] = None
 
         # PII detector and redactor
         pii_detector_id = builder.add_node(
@@ -132,7 +136,10 @@ def detect_and_redact_pii(text, redact={self.redact_pii}):
         "credit_card": r'\\b\\d{{4}}[\\s-]?\\d{{4}}[\\s-]?\\d{{4}}[\\s-]?\\d{{4}}\\b',
         "ip_address": r'\\b(?:[0-9]{{1,3}}\\.{{3}}[0-9]{{1,3}})\\b',
         "person_name": r'\\b[A-Z][a-z]+ [A-Z][a-z]+\\b',  # Simple name pattern
-        "date_of_birth": r'\\b(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/(19|20)\\d{{2}}\\b'
+        # Non-capturing groups: re.findall returns the WHOLE match string,
+        # not group tuples. Capturing-group form crashed `match.encode()`
+        # below (F9 #1112).
+        "date_of_birth": r'\\b(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])/(?:19|20)\\d{{2}}\\b'
     }}
 
     # Detect and redact each PII type
@@ -150,7 +157,7 @@ def detect_and_redact_pii(text, redact={self.redact_pii}):
                 }})
 
                 # Redact with type indicator
-                replacement = f"[{pii_type.upper()}_{hash_value}]"
+                replacement = f"[{{pii_type.upper()}}_{{hash_value}}]"
                 redacted_text = redacted_text.replace(match, replacement)
 
     # Additional sensitive data patterns
@@ -161,12 +168,23 @@ def detect_and_redact_pii(text, redact={self.redact_pii}):
             pattern = re.compile(f'{{term}}[:\\s]*([^,.;]+)', re.IGNORECASE)
             redacted_text = pattern.sub(f'{{term}}: [REDACTED]', redacted_text)
 
-    result = {{
+    # F9 #1113: function MUST return the redaction dict; the prior
+    # `result = {{...}}` bound a function-scope local that was never
+    # returned, dropping the redact-True branch's output to None.
+    return {{
         "processed_text": redacted_text,
         "pii_found": pii_found,
         "redaction_applied": original_text != redacted_text,
         "redaction_count": sum(len(items) for items in pii_found.values())
     }}
+
+# F9 #1114: PythonCodeNode reads `result` from module scope; the codegen
+# MUST execute the function at module scope so the outbound port carries
+# the redaction dict (the function was previously defined but never called).
+result = detect_and_redact_pii(text, redact={self.redact_pii})
+# Drop the helper so PythonCodeNode's output-validation gate (which
+# JSON-serializes every binding) sees only the JSON-safe `result`.
+del detect_and_redact_pii
 """
             },
         )
@@ -219,7 +237,7 @@ def anonymize_query(query, pii_info, anonymize={self.anonymize_queries}):
     for pattern, replacement in generalization_rules.items():
         if re.search(pattern, anonymized, re.IGNORECASE):
             anonymized = re.sub(pattern, replacement, anonymized, flags=re.IGNORECASE)
-            generalizations.append(f"{pattern}->{replacement}")
+            generalizations.append(f"{{pattern}}->{{replacement}}")
 
     # Add query perturbation for additional privacy
     if len(anonymized.split()) > 5:
@@ -561,6 +579,9 @@ def format_private_results(secure_results, audit_record, pii_info, anonymization
         builder.add_connection(dp_noise_id, "result", secure_aggregator_id, "dp_info")
 
         if self.audit_logging:
+            # audit_logger_id was bound inside the prior `if self.audit_logging`
+            # block (when self.audit_logging is True); narrow for the checker.
+            assert audit_logger_id is not None
             builder.add_connection(
                 pii_detector_id, "result", audit_logger_id, "pii_info"
             )
@@ -632,17 +653,51 @@ class SecureMultiPartyRAGNode(Node):
     def __init__(
         self,
         name: str = "secure_multiparty_rag",
-        parties: List[str] = None,
+        parties: Optional[List[str]] = None,
         protocol: str = "secret_sharing",
         threshold: int = 2,
     ):
-        self.parties = parties or []
+        resolved_parties = parties or []
+        super().__init__(
+            name=name,
+            parties=resolved_parties,
+            protocol=protocol,
+            threshold=threshold,
+        )
+        self.parties = resolved_parties
         self.protocol = protocol
         self.threshold = threshold
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="secure_multiparty_rag",
+                description="Node instance name",
+            ),
+            "parties": NodeParameter(
+                name="parties",
+                type=list,
+                required=False,
+                default=None,
+                description="Participating parties in the MPC protocol",
+            ),
+            "protocol": NodeParameter(
+                name="protocol",
+                type=str,
+                required=False,
+                default="secret_sharing",
+                description="Secure multiparty computation protocol",
+            ),
+            "threshold": NodeParameter(
+                name="threshold",
+                type=int,
+                required=False,
+                default=2,
+                description="Minimum parties required to reconstruct",
+            ),
             "query": NodeParameter(
                 name="query",
                 type=str,
@@ -826,17 +881,51 @@ class ComplianceRAGNode(Node):
     def __init__(
         self,
         name: str = "compliance_rag",
-        regulations: List[str] = None,
+        regulations: Optional[List[str]] = None,
         default_retention_days: int = 30,
         require_explicit_consent: bool = True,
     ):
-        self.regulations = regulations or ["gdpr", "ccpa"]
+        resolved_regulations = regulations or ["gdpr", "ccpa"]
+        super().__init__(
+            name=name,
+            regulations=resolved_regulations,
+            default_retention_days=default_retention_days,
+            require_explicit_consent=require_explicit_consent,
+        )
+        self.regulations = resolved_regulations
         self.default_retention_days = default_retention_days
         self.require_explicit_consent = require_explicit_consent
-        super().__init__(name)
 
     def get_parameters(self) -> Dict[str, NodeParameter]:
         return {
+            "name": NodeParameter(
+                name="name",
+                type=str,
+                required=False,
+                default="compliance_rag",
+                description="Node instance name",
+            ),
+            "regulations": NodeParameter(
+                name="regulations",
+                type=list,
+                required=False,
+                default=None,
+                description="Compliance regulations to enforce (gdpr, ccpa, ...)",
+            ),
+            "default_retention_days": NodeParameter(
+                name="default_retention_days",
+                type=int,
+                required=False,
+                default=30,
+                description="Default data retention period in days",
+            ),
+            "require_explicit_consent": NodeParameter(
+                name="require_explicit_consent",
+                type=bool,
+                required=False,
+                default=True,
+                description="Require explicit user consent before processing",
+            ),
             "query": NodeParameter(
                 name="query", type=str, required=True, description="Query to process"
             ),

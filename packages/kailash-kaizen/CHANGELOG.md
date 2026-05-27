@@ -2,6 +2,191 @@
 
 All notable changes to the Kaizen AI Agent Framework will be documented in this file.
 
+## [Unreleased]
+
+## [2.24.1] — 2026-05-25 — LLM-path crash fixes (#1140, #1141)
+
+### Fixed
+
+- **`GoogleGeminiProvider._extract_response` no longer crashes on `parts=None`
+  candidates (#1140).** Gemini returns candidates whose `.content` is populated
+  but `.content.parts` is `None` on SAFETY / MAX_TOKENS / tool-call-only
+  finishes. The guard now checks `.parts` before iterating, so these routine
+  production responses return a well-formed dict (empty content, empty
+  tool_calls) instead of raising `TypeError: 'NoneType' object is not
+iterable`. `finish_reason` still surfaces (`content_filter` / `length`) so
+  callers can detect the filter fired. The sibling `_format_tool_calls` path
+  carried the same None-deref and is fixed in the same change.
+- **`JSONOutputParser._convert_to_type` no longer silently corrupts results for
+  subscripted-generic OutputField types (#1141).** A `Signature` OutputField
+  typed `Optional[List[Dict]]` / `List[X]` / `Dict[K, V]` triggered
+  `TypeError: Subscripted generics cannot be used with class and instance
+checks` on Python 3.9+, which was swallowed and fell through to regex
+  key-value extraction — returning malformed strings while reporting success.
+  The parser now unwraps subscripted generics via `typing.get_origin` /
+  `get_args` before the `isinstance` check, so well-formed JSON parses into the
+  documented `list` / `dict` runtime shapes. Genuine malformed JSON still
+  surfaces as a parse failure.
+
+## [2.24.0] — 2026-05-20 — kaizen.nodes.rag provably correct + F9 cleanup (F8 R1)
+
+### Added
+
+- **Behavioral coverage of every preserved RAG class** (F8 B1–B10). 643+ new
+  tests + 5 spec sections (`specs/kaizen-rag.md` is now the authoritative
+  domain truth for the 58 RAG class definitions: 55 `@register_node`
+  classes + 2 `RAGConfig` dataclasses + `RAGWorkflowRegistry`). The brief's
+  "provably correct, not merely importable" criterion is now closed —
+  every class has at least one behavioral test in the unit, integration,
+  or regression tier.
+- **`RAGStrategyRouterNode` / `RAGQualityAnalyzerNode` /
+  `RAGPerformanceMonitorNode` / `RAGWorkflowRegistry`** all gain Tier-1
+  unit + Tier-2a integration coverage (B10). The smoke-test
+  zero-`xfail` invariant added in B9c is preserved.
+
+### Fixed
+
+- **`RAGStrategyRouterNode.run()` no longer raises `AttributeError`**
+  (F8 B10). The class accessed `self.name` but the kailash `Node` base
+  stores name on `self.metadata.name`; every call raised AttributeError
+  on the LLMAgentNode init. Routes through `self.metadata.name` now.
+- **`pii_detector` codegen** — F9 #1112: dob regex uses non-capturing
+  groups so `re.findall` returns full-match strings (not tuples that
+  crashed `.encode()`); F9 #1113: function returns its dict on the
+  `redact=True` branch (was bound to a function-scope local never
+  returned); F9 #1114: codegen now binds `result =
+detect_and_redact_pii(text, ...)` at module scope so PythonCodeNode
+  reads the redaction dict (the function was defined but never called).
+- **`ConversationalRAGNode.create_session` session_id** — F9 #1116:
+  now sourced from `secrets.token_hex(16)` (128-bit CSPRNG). The prior
+  `sha256(f"{user_or_anon}_{datetime}")[:16]` form admitted ~10⁶
+  brute-force ops within a 1-second window on the anonymous flow.
+- **`RAGEvaluationNode` codegen** — F9 #1117/#1118:
+  `test_executor`, `context_evaluator`, and `metric_aggregator` all
+  return their dicts AND invoke their inner functions at module scope.
+  `metric_aggregator` now imports the `datetime` class inside the
+  function body (a module-scope `from datetime import datetime` is
+  shadowed by PythonCodeNode's `datetime` module injection; the bare
+  `datetime.now()` against the module raised `AttributeError`).
+- **`RealtimeRAGNode.start_monitoring`** — F9 #1121: retains the
+  monitoring task on `self._monitor_task`; `stop_monitoring()` is now
+  async and cancels + awaits the retained task (the prior
+  fire-and-forget made the task GC-eligible and left the loop
+  uncancellable from outside).
+- **`RealtimeStreamingRAGNode` `processing_time` unit** — F9 #1122:
+  reported in SECONDS (the prior `chunk_idx * chunk_interval` form left
+  consumers off-by-1000× from the asyncio.sleep call's seconds-based
+  semantics; `chunk_interval` is canonically milliseconds).
+- **`RAGQualityAnalyzerNode.run()` `expected_results` kwarg** — wired
+  through into `quality_analysis["expected_result_count"]` /
+  `expected_recall_ratio`; the documented kwarg was previously accepted
+  but silently dropped (Rule 3c — documented kwargs without consumption
+  is a silent-fallback variant).
+
+### Changed (env-models compliance)
+
+- **All 36 hardcoded `"gpt-4"` model defaults across 9 rag modules
+  replaced with env-loaded `_DEFAULT_LLM_MODEL`** (F9 #1126). Mirrors
+  the `router.py:22-24` precedent landed in F8 B10:
+  ```python
+  _DEFAULT_LLM_MODEL = os.environ.get(
+      "OPENAI_PROD_MODEL", os.environ.get("DEFAULT_LLM_MODEL")
+  )
+  ```
+  Affected modules: `advanced`, `agentic`, `conversational`, `evaluation`,
+  `graph`, `multimodal`, `query_processing`, `similarity`, `workflows`.
+  **Behavior change**: existing callers relying on the `"gpt-4"` default
+  now get the env-resolved value (or `None` when neither env var is set
+  — env-models-compliant). Set `OPENAI_PROD_MODEL` in `.env` to restore
+  prior behavior.
+- **`kailash.middleware.mcp.enhanced_server.MCPToolNode` /
+  `MCPResourceNode`** (F8 A1-core) — constructors now use the canonical
+  keyword `super().__init__(name=name, **config)` form. The prior
+  `super().__init__(name)` positional form raised `TypeError` on every
+  construction (Node base is keyword-only). External subclasses calling
+  the constructor positionally MUST migrate to keyword form.
+
+### Migration
+
+- **`StreamingRAGNode` collision** (still active from 2.23.0): the
+  realtime variant is `RealtimeStreamingRAGNode`; `optimized` keeps
+  `StreamingRAGNode`. No change in 2.24.0.
+- **Env-models migration**: if your dev/prod environment relied on the
+  baked-in `"gpt-4"` default and does not set `OPENAI_PROD_MODEL` or
+  `DEFAULT_LLM_MODEL`, set one of them in `.env`. The `model` config
+  block on each LLM-using node now resolves to `None` when neither is
+  set, which propagates to the LLMAgentNode constructor.
+
+## [2.23.1] — 2026-05-19 — complete the `[rag]` extra (#891 follow-up)
+
+### Fixed
+
+- **`pip install "kailash-kaizen[rag]"` now imports `kaizen.nodes.rag`.**
+  2.23.0 resurrected the package but its `[rag]` extra declared only
+  `numpy`/`Pillow`; the resurrected import graph also needs `networkx`
+  (graph RAG — was undeclared anywhere) plus `requests` + `aiosqlite`
+  (pulled transitively via `kailash.nodes.api.rest` and the kailash data
+  path the rag modules import). `pip install "kailash-kaizen[rag]==2.23.0";
+import kaizen.nodes.rag` raised `ModuleNotFoundError: networkx`. The
+  `[rag]` extra is now the complete dependency set:
+  `numpy, Pillow, networkx, requests, aiosqlite`. **`kaizen.nodes.rag`
+  requires `pip install "kailash-kaizen[rag]"`** (its node-functional deps
+  are intentionally behind the extra per the issue #890 core-dep audit;
+  bare `import kaizen` is unaffected — the rag package is deep-import-only).
+
+## [2.23.0] — 2026-05-19 — resurrect `kaizen.nodes.rag` (#891 follow-up)
+
+### Fixed
+
+- **`kaizen.nodes.rag` is importable again** — the 17-module RAG package
+  (~53 node classes: GraphRAG, AgenticRAG, FederatedRAG, MultimodalRAG,
+  privacy-preserving RAG, ColBERT/HyDE retrieval, RAG evaluation, etc.) was
+  **un-importable from the 2026-03-11 monorepo move (`b553104c`) until now** —
+  every module's relative imports pointed at a non-existent
+  `kaizen.nodes.{base,code,data,logic,security}` / `kaizen.runtime` /
+  `kaizen.workflow` tree. All ~40 broken imports across 14 modules are
+  repointed to their real `kailash.*` locations. The package now imports clean.
+
+### Changed
+
+- **`rag.realtime.StreamingRAGNode` → `RealtimeStreamingRAGNode`** — once the
+  package became importable, `rag.realtime` and `rag.optimized` both registered
+  the global name `StreamingRAGNode`, which the kailash 2.23.0 cross-module
+  collision guard (#891) rejects at import. The realtime node is renamed
+  (`rag/__init__.py` already aliased it `as RealtimeStreamingRAGNode`);
+  `rag.optimized` keeps `StreamingRAGNode`. Migration for the realtime node:
+  `add_node("StreamingRAGNode", ...)` → `add_node("RealtimeStreamingRAGNode", ...)`.
+  Requires `kailash>=2.23.0`.
+
+## [2.22.0] — 2026-05-19 — node-registry collision fix (#891)
+
+### Changed
+
+- **`HybridSearchNode` renamed to `SemanticHybridSearchNode` (#891)** — the RAG
+  hybrid-search node (`kaizen.nodes.ai.hybrid_search`) registered the same global
+  registry name as kailash-dataflow's pgvector `HybridSearchNode`, making
+  `add_node("HybridSearchNode")` resolve import-order-dependently. The class is
+  internal-only (not on the package's public `__init__` surface), so no
+  deprecation shim is provided. Deep importers migrate:
+  `from kaizen.nodes.ai.hybrid_search import HybridSearchNode` →
+  `import SemanticHybridSearchNode`; `add_node("HybridSearchNode", ...)` →
+  `add_node("SemanticHybridSearchNode", ...)`.
+
+## [2.21.1] — 2026-05-18 — restore `kaizen.api` deprecation shim (#1071)
+
+### Fixed
+
+- **`kaizen.api` restored as a deprecation shim (#1071)** — the structural-split refactor (#75) relocated the unified Agent API from `kaizen.api` to `kaizen_agents.api` and removed `kaizen.api` outright with no deprecation cycle. `from kaizen.api import Agent` raised `ModuleNotFoundError` on every published release — a hard break for every downstream caller on first `pip install --upgrade`. `kaizen.api` is now restored as a PEP 562 deprecation shim: every public symbol that historically lived under `kaizen.api` resolves through it and emits a `DeprecationWarning` naming the new import path on attribute access. The shim will be removed in a future major release.
+
+### Migration — `kaizen.api` → `kaizen`
+
+| Old (deprecated)                  | New                                      |
+| --------------------------------- | ---------------------------------------- |
+| `from kaizen.api import Agent`    | `from kaizen import Agent`               |
+| `from kaizen.api import <symbol>` | `from kaizen_agents.api import <symbol>` |
+
+Where `<symbol>` is any of the historical secondary surface: `AgentConfig`, `AgentResult`, `ToolCallRecord`, `CapabilityPresets`, `AgentCapabilities`, `ExecutionMode`, `MemoryDepth`, `ToolAccess`, `ConfigurationError`, `validate_configuration`, `validate_model_runtime_compatibility`, `resolve_memory_shortcut`, `resolve_runtime_shortcut`, `resolve_tool_access_shortcut`. `Agent` resolves through `kaizen` so the `kaizen_agents` → `kaizen.core.agents` fallback chain is preserved on installs without the optional `kaizen-agents` package.
+
 ## [2.21.0] — 2026-05-09 — slim-core decoupling: 9 core deps + provider/observability/db/cache/rag extras (#890)
 
 Minor release shipping the kailash-kaizen side of the kailash 2.18.0 / #890 slim-core decoupling. **Install-shape breaking change** — kaizen drops from 29 → 9 core dependencies. Provider SDKs (Azure, Google, token counters), observability (Prometheus/OpenTelemetry/structlog), database (aiosqlite/asyncpg), cache (Redis), RAG (numpy/Pillow), research-validator (GitPython), and HTTP server (FastAPI/uvicorn) all move to opt-in extras. The new `[all]` umbrella preserves the pre-2.21.0 default install for users who do not want to enumerate which subsystem they consume.
